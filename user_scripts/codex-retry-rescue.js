@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Codex Retry Rescue
-// @version      0.11.1
+// @version      0.12.0
 // @description  Codex 断流/限流/会话死亡自动救援：重试逼近上限时打断并继续刷新预算，400 类死会话自动开新对话接续，带状态条与后台看门狗
 // ==/UserScript==
 //
@@ -46,9 +46,10 @@
   if (window.top && window.self && window.top !== window.self) return;
 
   const API_KEY = "__codexRetryRescue";
-  const BADGE_ID = "codex-retry-rescue-badge";
+  const BAR_ID = "codex-retry-rescue-bar";
   const PANEL_ID = "codex-retry-rescue-panel";
   const HOST_ID = "codex-retry-rescue-host";
+  const STYLE_ID = "codex-retry-rescue-style";
   const QUICK_BTN_ID = "codex-retry-rescue-quick";
   const CONT_BTN_ID = "codex-retry-rescue-cont";
   const SELF_HOST_ID = "codex-retry-rescue-selfhost";
@@ -200,7 +201,9 @@
     timer: 0,
     worker: null,
     workerUrl: "",
-    badgeSig: "",
+    barSig: "",
+    theme: "",
+    themeAt: 0,
     lastKickAt: 0,
     // 死会话迁移：同一 request id 只迁一次；整脚本最多迁 maxMigrations 次
     migrations: 0,
@@ -785,32 +788,21 @@
     armSelfHost(reason);
   }
 
-  /** 到点：等价于点一次「继续」按钮；条件不满足就重置计时 */
+  /** 顺延重排：到点但条件不合适，只往后挪一小段，不重抽满 30–300s */
+  function rearmSelfHostLater(ms) {
+    clearSelfHostTimer();
+    state.selfHostAt = now() + ms;
+    state.selfHostTimer = setTimeout(() => { state.selfHostTimer = 0; void fireSelfHost(); }, ms);
+  }
+
+  /** 到点：等价于点一次「继续」按钮；条件不满足就短顺延 */
   async function fireSelfHost() {
     if (!CONFIG.selfHost) return;
-    const st = buttonState();
-    // 未到发送态 / 有草稿 / 刚有人操作：短顺延，不要又抽满 30–300s
-    if (st.kind !== "send") {
-      state.selfHostAt = now() + 15000;
-      state.selfHostTimer = setTimeout(() => { state.selfHostTimer = 0; void fireSelfHost(); }, 15000);
-      return;
-    }
-    if (!composerEmpty()) {
-      state.selfHostAt = now() + 20000;
-      state.selfHostTimer = setTimeout(() => { state.selfHostTimer = 0; void fireSelfHost(); }, 20000);
-      return;
-    }
-    if (now() - state.lastHumanInputAt < 5000) {
-      state.selfHostAt = now() + 10000;
-      state.selfHostTimer = setTimeout(() => { state.selfHostTimer = 0; void fireSelfHost(); }, 10000);
-      return;
-    }
+    if (buttonState().kind !== "send") return rearmSelfHostLater(15000);
+    if (!composerEmpty()) return rearmSelfHostLater(20000);
+    if (now() - state.lastHumanInputAt < 5000) return rearmSelfHostLater(10000);
     note("自托管：到点，按一次「继续」");
-    const ok = await sendContinueNow();
-    if (!ok) {
-      state.selfHostAt = now() + 20000;
-      state.selfHostTimer = setTimeout(() => { state.selfHostTimer = 0; void fireSelfHost(); }, 20000);
-    }
+    if (!await sendContinueNow()) rearmSelfHostLater(20000);
   }
 
   /** 与「继续」按钮同一条路径 */
@@ -856,6 +848,10 @@
       note("输入框有内容，先清掉或自己发，快捷接续未执行");
       return;
     }
+
+    // 你手动接管这条线了，本轮耗尽证据作废 —— 否则切完新聊天，
+    // 旧会话那侧还可能被补发一次「继续」。
+    state.turnExhausted = null;
 
     if (!clickNewChat()) {
       note("没找到「新聊天」按钮");
@@ -934,23 +930,27 @@
 
   // ---------------------------------------------------------- 死会话迁移（400）
   /**
-   * 是否是「对话末尾那个特殊错误框」里的匹配节点。
-   * 作者这条链路的实测形态：aside（圆角描边框 + ⓘ）> … > span.wrap-anywhere
-   *   > "bad response status code 400 (…)"
-   * 要求节点必须落在 CONFIG.platform.fatalContainers 列出的容器里 ——
-   * 正文里偶然出现「400」不算，否则好端端的对话会被判成会话已死。
+   * 错误框容器判定。作者这条链路的实测形态：
+   *   aside（圆角描边框 + ⓘ）> … > span.wrap-anywhere > "bad response status code 400 (…)"
+   * 选择器来自 CONFIG.platform.fatalContainers，换皮时在那里改。
    */
   function inFatalContainer(el) {
     try { return FATAL_CONTAINER_SEL.some(sel => el.closest(sel)); } catch (_) { return false; }
   }
 
-  function isFatalErrorLeaf(el) {
-    if (!el || el.nodeType !== 1) return false;
-    if (el.id === HOST_ID || el.closest?.(`#${HOST_ID}`)) return false;
-    const t = (el.textContent || "").replace(/\s+/g, " ").trim();
-    if (!t || t.length > 300 || !FATAL_ERR_RE.test(t)) return false;
-    if ([...el.children].some(c => FATAL_ERR_RE.test(c.textContent || ""))) return false;
-    return inFatalContainer(el);
+  /**
+   * 致命错误框 = 错误文案叶节点里，命中状态码正则、且确实在错误容器里的那些。
+   * 复用 errorTextLeaves 的扫描结果，免得每拍多扫一遍整棵树。
+   * 容器这一层不能省：正文里偶然出现「400」不该被当成会话已死。
+   */
+  function fatalErrorLeaves() {
+    const out = [];
+    for (const el of errorTextLeaves()) {
+      const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+      if (!t || t.length > 300) continue;
+      if (FATAL_ERR_RE.test(t) && inFatalContainer(el)) out.push(el);
+    }
+    return out;
   }
 
   function parseFatalLeaf(el) {
@@ -961,16 +961,6 @@
     if (!CONFIG.fatalCodes.includes(code)) return null;
     const reqId = t.match(FATAL_REQ_ID_RE)?.[1] || "";
     return { code, text: t.slice(0, 180), el, key: reqId || t.slice(0, 120) };
-  }
-
-  /** 对话区里所有「错误框」叶节点（文档序） */
-  function fatalErrorLeaves() {
-    const root = threadRoot() || document.body;
-    const out = [];
-    for (const el of root.querySelectorAll("span, div, aside, pre, code")) {
-      if (isFatalErrorLeaf(el)) out.push(el);
-    }
-    return out;
   }
 
   /**
@@ -1245,6 +1235,7 @@
     if (state.migrations >= CONFIG.maxMigrations) {
       note(`迁移已达上限 ${CONFIG.maxMigrations}，不再自动开新对话`);
       state.status = "migrate_blocked";
+      state.turnExhausted = null;   // 会话已死，别再往它里面发「继续」
       return;
     }
 
@@ -1253,8 +1244,13 @@
     if (draft) {
       note("输入框里有你正在写的内容，迁移跳过");
       state.status = "migrate_blocked";
+      state.turnExhausted = null;
       return;
     }
+
+    // 确认期还没过也先作废本轮耗尽证据：这条会话已经救不回来，
+    // 留在手里只会在迁移失败的某个拍上被当成「该发继续」。
+    state.turnExhausted = null;
 
     // 延迟确认：不能一看到错误框就开新聊天
     if (!confirmFatalPending(err)) return;
@@ -1511,171 +1507,213 @@
     }
   }
 
-  // ------------------------------------------------------------ 状态指示器
-  const STATUS_META = {
-    paused:          { dot: "#8b8b8b", label: "已暂停" },
-    idle:            { dot: "#8b8b8b", label: "待命" },
-    running:         { dot: "#3b82f6", label: "运行中" },
-    streaming:       { dot: "#22c55e", label: "输出中" },
-    retrying:        { dot: "#f59e0b", label: "重试中" },
-    confirming:      { dot: "#eab308", label: "验收中" },
-    acting:          { dot: "#f97316", label: "接管中" },
-    interrupted:     { dot: "#a855f7", label: "已打断" },
-    exhausted:       { dot: "#ef4444", label: "重试耗尽" },
-    fatal_pending:   { dot: "#eab308", label: "待确认" },
-    migrating:       { dot: "#06b6d4", label: "迁移中" },
-    migrated:        { dot: "#22c55e", label: "已迁移" },
-    migrate_blocked: { dot: "#ef4444", label: "迁移受阻" },
-    done:            { dot: "#22c55e", label: "已完成" },
+  // ------------------------------------------------------------ 状态与样式
+  /**
+   * 14 个状态收敛成 5 种语义色，颜色只回答「现在要不要你操心」，
+   * 具体在做什么交给文案。原来同一种绿要分给三个状态、橙黄各两个，读不出差别。
+   */
+  const C = {
+    neutral: "#9a958c",  // 待命 / 已暂停
+    live:    "#4c8dff",  // 正在跑：运行中 / 输出中 / 已打断 / 迁移中
+    wait:    "#e8a33d",  // 需要等：重试中 / 验收中 / 接管中 / 待确认
+    good:    "#3fbf7f",  // 成了：已迁移 / 已完成
+    bad:     "#e2573b",  // 出事：重试耗尽 / 迁移受阻
   };
 
-  // ------------------------------------------------------ 容器与拖动
+  const STATUS_META = {
+    paused:          { dot: C.neutral, label: "已暂停" },
+    idle:            { dot: C.neutral, label: "待命" },
+    running:         { dot: C.live,    label: "运行中" },
+    streaming:       { dot: C.live,    label: "输出中" },
+    retrying:        { dot: C.wait,    label: "重试中" },
+    confirming:      { dot: C.wait,    label: "验收中" },
+    acting:          { dot: C.wait,    label: "接管中" },
+    interrupted:     { dot: C.live,    label: "已打断" },
+    exhausted:       { dot: C.bad,     label: "重试耗尽" },
+    fatal_pending:   { dot: C.wait,    label: "待确认" },
+    migrating:       { dot: C.live,    label: "迁移中" },
+    migrated:        { dot: C.good,    label: "已迁移" },
+    migrate_blocked: { dot: C.bad,     label: "迁移受阻" },
+    done:            { dot: C.good,    label: "已完成" },
+  };
+
   /**
-   * 面板和指示器放在同一个容器里（面板在上、指示器在下，右对齐），
+   * 样式一次性注入。原来四个元素各自往 cssText 上写同一段玻璃拟态，
+   * 改一个数值要动四处；而且写死深色，Codex 换亮色主题就变成一块脏黑。
+   * 现在颜色全部走 CSS 变量，靠 host 的 data-theme 切明暗。
+   */
+  const UI_CSS = `
+#${HOST_ID} {
+  --crr-ui: ui-sans-serif, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --crr-mono: ui-monospace, SFMono-Regular, Consolas, "Cascadia Mono", monospace;
+  --fg: #eceae6; --fg-dim: rgba(236,234,230,.56); --fg-faint: rgba(236,234,230,.34);
+  --surface: rgba(20,19,17,.80); --surface-2: rgba(255,255,255,.07);
+  --line: rgba(255,255,255,.13); --line-strong: rgba(255,255,255,.26); --line-soft: rgba(255,255,255,.07);
+  --shadow: 0 8px 28px rgba(0,0,0,.34); --ring: rgba(120,160,255,.5);
+  /* 与 JS 里的 C.neutral / C.good 同值，只用于文字状态色 */
+  --neutral: #9a958c; --good: #3fbf7f;
+}
+#${HOST_ID}[data-theme="light"] {
+  --fg: #1b1a17; --fg-dim: rgba(27,26,23,.58); --fg-faint: rgba(27,26,23,.36);
+  --surface: rgba(255,255,255,.88); --surface-2: rgba(27,26,23,.05);
+  --line: rgba(27,26,23,.13); --line-strong: rgba(27,26,23,.28); --line-soft: rgba(27,26,23,.08);
+  --shadow: 0 8px 28px rgba(20,18,14,.13); --ring: rgba(60,100,200,.4);
+}
+#${HOST_ID} .crr-bar {
+  pointer-events:auto; cursor:grab; user-select:none; touch-action:none;
+  display:flex; align-items:center; gap:8px;
+  padding:5px 8px 5px 10px; border-radius:999px;
+  font:500 11.5px/1.45 var(--crr-ui); color:var(--fg);
+  background:var(--surface); border:1px solid var(--line); box-shadow:var(--shadow);
+  backdrop-filter:blur(12px) saturate(1.35); -webkit-backdrop-filter:blur(12px) saturate(1.35);
+  transition:border-color .18s ease, box-shadow .18s ease, opacity .18s ease;
+}
+#${HOST_ID} .crr-bar:hover { border-color:var(--line-strong); }
+#${HOST_ID} .crr-bar[data-drag="1"] { cursor:grabbing; }
+#${HOST_ID} .crr-stat { display:flex;align-items:center;gap:6px;min-width:0; }
+#${HOST_ID} .crr-dot { width:7px;height:7px;border-radius:50%;flex:0 0 auto;transition:background .25s ease,box-shadow .25s ease; }
+#${HOST_ID} .crr-label { font-weight:600;letter-spacing:.01em;white-space:nowrap; }
+#${HOST_ID} .crr-meter { font:600 11px var(--crr-mono);font-variant-numeric:tabular-nums;opacity:.92; }
+#${HOST_ID} .crr-sub { font-size:10.5px;color:var(--fg-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
+#${HOST_ID} .crr-meter:empty,#${HOST_ID} .crr-sub:empty { display:none; }
+#${HOST_ID} .crr-div { width:1px;height:15px;flex:0 0 auto;background:var(--line); }
+#${HOST_ID} .crr-acts { display:flex;align-items:center;gap:3px; }
+#${HOST_ID} .crr-btn {
+  pointer-events:auto;cursor:pointer;appearance:none;
+  display:inline-flex;align-items:center;gap:5px;
+  padding:3px 9px;border-radius:999px;
+  font:600 11px/1.5 var(--crr-ui);
+  color:var(--fg-dim);background:transparent;border:1px solid transparent;
+  transition:color .15s ease,background .15s ease,border-color .15s ease,transform .08s ease;
+}
+#${HOST_ID} .crr-btn:hover { color:var(--fg);background:var(--surface-2);border-color:var(--line); }
+#${HOST_ID} .crr-btn:active { transform:scale(.96); }
+#${HOST_ID} .crr-btn[data-on="1"] { color:var(--fg);background:var(--surface-2);border-color:var(--line-strong); }
+#${HOST_ID} .crr-btn[data-role="toggle"][data-on="1"] { color:var(--good); }
+#${HOST_ID} .crr-btn[data-role="toggle"][data-on="0"] { color:var(--neutral); }
+#${HOST_ID} .crr-btn .crr-dot { width:6px;height:6px; }
+#${HOST_ID} .crr-caret { font-size:9px;color:var(--fg-faint);transition:transform .2s ease; }
+#${HOST_ID} .crr-caret[data-open="1"] { transform:rotate(180deg); }
+#${HOST_ID} .crr-panel {
+  pointer-events:auto;user-select:none;
+  width:274px;padding:11px 12px 10px;border-radius:14px;
+  max-height:calc(100vh - 92px);overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;
+  font:500 11.5px/1.5 var(--crr-ui);color:var(--fg);
+  background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow);
+  backdrop-filter:blur(16px) saturate(1.35); -webkit-backdrop-filter:blur(16px) saturate(1.35);
+}
+#${HOST_ID} .crr-head { display:flex;align-items:center;justify-content:space-between;gap:8px; }
+#${HOST_ID} .crr-title { font-size:12px;font-weight:700;letter-spacing:.02em; }
+#${HOST_ID} .crr-group { font:600 9.5px var(--crr-mono);letter-spacing:.14em;text-transform:uppercase;color:var(--fg-faint);margin:11px 0 1px; }
+#${HOST_ID} .crr-group:first-of-type { margin-top:8px; }
+#${HOST_ID} .crr-row { display:flex;align-items:center;justify-content:space-between;gap:10px;padding:3.5px 0; }
+#${HOST_ID} .crr-key { font-size:11px;color:var(--fg-dim);white-space:nowrap; }
+#${HOST_ID} .crr-val { font:600 11px var(--crr-mono);font-variant-numeric:tabular-nums;text-align:right; }
+#${HOST_ID} .crr-val[data-dim="1"] { color:var(--fg-faint);font-weight:500; }
+#${HOST_ID} .crr-input {
+  width:62px;padding:3px 6px;border-radius:7px;text-align:center;outline:none;
+  font:600 11px var(--crr-mono);color:var(--fg);
+  background:var(--surface-2);border:1px solid var(--line);
+  transition:border-color .15s ease,box-shadow .15s ease;
+}
+#${HOST_ID} .crr-input:focus { border-color:var(--ring);box-shadow:0 0 0 2px var(--ring); }
+#${HOST_ID} .crr-input[data-wide="1"] { width:118px;text-align:left;font:500 11px var(--crr-ui); }
+#${HOST_ID} .crr-step {
+  width:20px;height:20px;padding:0;border-radius:6px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  font-size:12px;line-height:1;color:var(--fg-dim);
+  background:var(--surface-2);border:1px solid var(--line);
+  transition:color .15s ease,border-color .15s ease;
+}
+#${HOST_ID} .crr-step:hover { color:var(--fg);border-color:var(--line-strong); }
+#${HOST_ID} .crr-wide {
+  flex:1;padding:5px 9px;border-radius:8px;cursor:pointer;
+  font:600 11px var(--crr-ui);color:var(--fg);
+  background:var(--surface-2);border:1px solid var(--line);
+  transition:color .15s ease,border-color .15s ease;
+}
+#${HOST_ID} .crr-wide:hover { border-color:var(--line-strong); }
+#${HOST_ID} .crr-foot { display:flex;gap:6px;margin-top:11px; }
+/* 关着的自托管键整颗退到灰，不用看文案也知道没开 */
+#${HOST_ID} #${SELF_HOST_ID}[data-on="0"] { color:var(--neutral); }
+#${HOST_ID} .crr-log {
+  margin-top:9px;padding-top:9px;border-top:1px solid var(--line-soft);
+  font:400 10px/1.6 var(--crr-mono);color:var(--fg-dim);
+  max-height:76px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;
+  scrollbar-width:thin;
+}
+@media (prefers-reduced-motion: reduce) {
+  #${HOST_ID} * { transition:none !important; animation:none !important; }
+}
+`;
+
+  function ensureStyle() {
+    if (document.getElementById(STYLE_ID)) return;
+    const tag = document.createElement("style");
+    tag.id = STYLE_ID;
+    tag.textContent = UI_CSS;
+    document.head.appendChild(tag);
+  }
+
+  /**
+   * 明暗跟随 Codex 自己的界面底色，而不是系统的 prefers-color-scheme ——
+   * 应用内主题可以和系统设置相反。取对话区往上第一个不透明背景算亮度。
+   */
+  function detectTheme() {
+    try {
+      for (let el = threadRoot() || document.body; el && el.nodeType === 1; el = el.parentElement) {
+        const bg = getComputedStyle(el).backgroundColor || "";
+        const m = bg.match(/[\d.]+/g);
+        if (!m || m.length < 3) continue;
+        if (m.length >= 4 && parseFloat(m[3]) === 0) continue;   // 全透明，继续往上找
+        const [r, g, b] = m.map(Number);
+        return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 > 0.55 ? "light" : "dark";
+      }
+    } catch (_) { /* 拿不到样式就用深色兜底 */ }
+    return "dark";
+  }
+
+  // ------------------------------------------------------ 容器与拖动
+  const mk = (tag, cls, role) => {
+    const el = document.createElement(tag);
+    if (cls) el.className = cls;
+    if (role) el.dataset.role = role;
+    return el;
+  };
+
+  /**
+   * 面板和工具条放在同一个容器里（面板在上、工具条在下，右对齐），
    * 这样拖动只需要移动容器，面板会自动跟着走，不用两处各算一遍坐标。
    */
   function ensureHost() {
     let host = document.getElementById(HOST_ID);
     if (host) return host;
 
+    ensureStyle();
     host = document.createElement("div");
     host.id = HOST_ID;
+    host.dataset.theme = state.theme = detectTheme();
     host.style.cssText = [
       "position:fixed", "z-index:2147483600",
       "display:flex", "flex-direction:column", "align-items:flex-end", "gap:8px",
       "pointer-events:none",   // 容器本身不吃事件，只有子元素吃
     ].join(";");
     document.body.appendChild(host);
+    state.themeAt = now();
     applyPos();
     return host;
   }
 
-  /** 自托管独立状态条：开/关 + 倒计时，点击可切换 */
-  function ensureSelfHostEl() {
-    let el = document.getElementById(SELF_HOST_ID);
-    if (el) return el;
-    const host = ensureHost();
-    el = document.createElement("button");
-    el.id = SELF_HOST_ID;
-    el.type = "button";
-    el.title = "点击开关自托管（轮次结束后随机 30–300s 自动发「继续」）";
-    el.style.cssText = [
-      "pointer-events:auto", "cursor:pointer",
-      "display:flex", "align-items:center", "gap:6px",
-      "padding:5px 11px", "border-radius:999px",
-      "font:600 11px/1.3 ui-monospace,Consolas,monospace",
-      "color:#e8e8ea", "background:rgba(24,24,27,.78)",
-      "backdrop-filter:blur(10px)", "-webkit-backdrop-filter:blur(10px)",
-      "border:1px solid rgba(255,255,255,.12)",
-      "box-shadow:0 4px 16px rgba(0,0,0,.28)",
-      "user-select:none", "touch-action:none", "white-space:nowrap",
-      "-webkit-app-region:no-drag",
-    ].join(";");
-
-    const dot = document.createElement("span");
-    dot.dataset.role = "sh-dot";
-    dot.style.cssText = "width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:#8b8b8b";
-    const label = document.createElement("span");
-    label.dataset.role = "sh-label";
-    label.textContent = "自托管 关";
-    el.append(dot, label);
-
-    el.addEventListener("click", e => {
-      e.stopPropagation();
-      CONFIG.selfHost = !CONFIG.selfHost;
-      saveSettings();
-      if (!CONFIG.selfHost) cancelSelfHost("已关闭");
-      else {
-        state.selfHostHold = false;
-        armSelfHost("手动开启");
-      }
-      paintSelfHost();
-    });
-
-    host.appendChild(el);
-    return el;
-  }
-
-  function paintSelfHost() {
-    const el = ensureSelfHostEl();
-    const on = !!CONFIG.selfHost;
-    const left = state.selfHostAt ? Math.max(0, Math.round((state.selfHostAt - now()) / 1000)) : 0;
-    const text = on
-      ? (state.selfHostTimer ? `自托管 ${left}s` : "自托管 待命")
-      : "自托管 关";
-    const color = on ? (state.selfHostTimer ? "#22c55e" : "#eab308") : "#8b8b8b";
-    const sig = text + color;
-    if (el.dataset.sig === sig) return;
-    el.dataset.sig = sig;
-    const dot = el.querySelector('[data-role="sh-dot"]');
-    const label = el.querySelector('[data-role="sh-label"]');
-    if (dot) {
-      dot.style.background = color;
-      dot.style.boxShadow = on ? `0 0 6px ${color}99` : "none";
-    }
-    if (label) label.textContent = text;
-    el.style.opacity = on ? "1" : "0.72";
-  }
-
-  /** 快捷「继续」按钮：发送 continueText */
-  function ensureContBtn() {
-    let el = document.getElementById(CONT_BTN_ID);
-    if (el) return el;
-    const host = ensureHost();
-    el = document.createElement("button");
-    el.id = CONT_BTN_ID;
-    el.type = "button";
-    el.textContent = "继续";
-    el.title = "发送「继续」（Ctrl+Alt+C 亦可）";
-    el.style.cssText = [
-      "pointer-events:auto", "cursor:pointer",
-      "padding:5px 12px", "border-radius:999px",
-      "font:600 11px/1.3 ui-sans-serif,-apple-system,'Segoe UI',sans-serif",
-      "color:#e8e8ea", "background:rgba(24,24,27,.78)",
-      "backdrop-filter:blur(10px)", "-webkit-backdrop-filter:blur(10px)",
-      "border:1px solid rgba(255,255,255,.12)",
-      "box-shadow:0 4px 16px rgba(0,0,0,.28)",
-      "user-select:none", "touch-action:none",
-      "-webkit-app-region:no-drag",
-    ].join(";");
-    el.addEventListener("click", e => {
-      e.stopPropagation();
-      sendContinueNow();
-    });
-    host.insertBefore(el, host.firstChild);
-    return el;
-  }
-
-  /** 快捷「接续」按钮：开新聊天 + 填好指令，不发送 */
-  function ensureQuickBtn() {
-    let el = document.getElementById(QUICK_BTN_ID);
-    if (el) return el;
-    const host = ensureHost();
-    el = document.createElement("button");
-    el.id = QUICK_BTN_ID;
-    el.type = "button";
-    el.textContent = "接续";
-    el.title = "新聊天并填入：读取{当前id}，继续（不自动发送）";
-    el.style.cssText = [
-      "pointer-events:auto", "cursor:pointer",
-      "padding:5px 12px", "border-radius:999px",
-      "font:600 11px/1.3 ui-sans-serif,-apple-system,'Segoe UI',sans-serif",
-      "color:#e8e8ea", "background:rgba(24,24,27,.78)",
-      "backdrop-filter:blur(10px)", "-webkit-backdrop-filter:blur(10px)",
-      "border:1px solid rgba(255,255,255,.12)",
-      "box-shadow:0 4px 16px rgba(0,0,0,.28)",
-      "user-select:none", "touch-action:none",
-      "-webkit-app-region:no-drag",
-    ].join(";");
-    el.addEventListener("click", e => {
-      e.stopPropagation();
-      quickNewChatResume();
-    });
-    // 排在 badge 上面（host 是 column，flex-end）
-    const badge = document.getElementById(BADGE_ID);
-    if (badge) host.insertBefore(el, badge);
-    else host.appendChild(el);
-    return el;
+  /** Codex 可以运行中换主题，隔几秒重测一次底色；颜色全在样式表里，这里只翻 data-theme */
+  function refreshTheme() {
+    if (now() - state.themeAt < 4000) return;
+    const host = document.getElementById(HOST_ID);
+    if (!host) return;
+    state.themeAt = now();
+    const t = detectTheme();
+    if (t === state.theme) return;
+    state.theme = t;
+    host.dataset.theme = t;
   }
 
   /** 把 CONFIG.pos 写到容器上，并夹住不让它跑出可视区 */
@@ -1694,8 +1732,9 @@
   }
 
   /**
-   * 指示器兼作拖动手柄。难点是同一个元素既要能点（展开面板）又要能拖，
+   * 工具条兼作拖动手柄。难点是同一个元素既要能点（展开面板）又要能拖，
    * 所以用位移阈值区分：移动不超过 DRAG_SLOP 才算点击。
+   * 条上的动作键必须排除在外，否则点「继续」会顺带把整条拖走。
    */
   const DRAG_SLOP = 4;
 
@@ -1705,13 +1744,13 @@
     let startX = 0, startY = 0, startRight = 0, startBottom = 0;
 
     handle.addEventListener("pointerdown", e => {
-      if (e.button !== 0) return;
+      if (e.button !== 0 || e.target.closest("button")) return;
       dragging = true;
       moved = 0;
       startX = e.clientX; startY = e.clientY;
       startRight = CONFIG.pos.right; startBottom = CONFIG.pos.bottom;
       handle.setPointerCapture?.(e.pointerId);
-      handle.style.cursor = "grabbing";
+      handle.dataset.drag = "1";
       e.preventDefault();
     });
 
@@ -1729,7 +1768,7 @@
     const finish = e => {
       if (!dragging) return;
       dragging = false;
-      handle.style.cursor = "pointer";
+      delete handle.dataset.drag;
       handle.releasePointerCapture?.(e.pointerId);
       if (moved <= DRAG_SLOP) togglePanel();   // 没怎么动 = 这是一次点击
       else saveSettings();                      // 真拖了才落盘
@@ -1738,58 +1777,68 @@
     handle.addEventListener("pointercancel", finish);
   }
 
-  function ensureBadge() {
-    let el = document.getElementById(BADGE_ID);
-    if (el) return el;
-
-    const host = ensureHost();
-    el = document.createElement("div");
-    el.id = BADGE_ID;
-    el.style.cssText = [
-      "display:flex", "align-items:center", "gap:8px",
-      "padding:6px 11px 6px 9px", "border-radius:999px",
-      "font:500 11.5px/1.4 ui-sans-serif,-apple-system,'Segoe UI',sans-serif",
-      "color:#e8e8ea", "background:rgba(24,24,27,.78)",
-      "backdrop-filter:blur(10px)", "-webkit-backdrop-filter:blur(10px)",
-      "border:1px solid rgba(255,255,255,.10)",
-      "box-shadow:0 4px 16px rgba(0,0,0,.28)",
-      "cursor:pointer", "user-select:none", "pointer-events:auto",
-      "touch-action:none",     // 否则触控/触摸板拖动会被浏览器手势吃掉
-      "transition:opacity .18s ease",
-    ].join(";");
-    el.title = "点击展开面板 · 拖动可移动位置";
-
-    const dot = document.createElement("span");
-    dot.dataset.role = "dot";
-    dot.style.cssText = "width:7px;height:7px;border-radius:50%;flex:0 0 auto;transition:background .2s ease,box-shadow .2s ease";
-
-    const label = document.createElement("span");
-    label.dataset.role = "label";
-
-    const meter = document.createElement("span");
-    meter.dataset.role = "meter";
-    meter.style.cssText = "font:600 11px ui-monospace,SFMono-Regular,Consolas,monospace;opacity:.92;font-variant-numeric:tabular-nums";
-
-    const sub = document.createElement("span");
-    sub.dataset.role = "sub";
-    sub.style.cssText = "opacity:.55;font-size:10.5px";
-
-    const caret = document.createElement("span");
-    caret.dataset.role = "caret";
-    caret.style.cssText = "opacity:.45;font-size:9px;margin-left:1px;transition:transform .18s ease";
-    caret.textContent = "▾";
-
-    el.append(dot, label, meter, sub, caret);
-    attachDrag(el);
-    ensureQuickBtn();
-    ensureContBtn();
-    ensureSelfHostEl();
-    host.appendChild(el);
+  // ---------------------------------------------------------------- 工具条
+  /** 动作键：可选状态点 + 文案，样式全部交给样式表 */
+  function mkAction(id, text, title, onClick, dotRole) {
+    const el = document.createElement("button");
+    el.id = id;
+    el.type = "button";
+    el.className = "crr-btn";
+    el.title = title;
+    if (dotRole) el.append(mk("span", "crr-dot", dotRole));
+    el.append(mk("span", null, "btn-label"));
+    el.lastChild.textContent = text;
+    el.addEventListener("click", onClick);
     return el;
   }
 
-  function paintBadge() {
-    const el = ensureBadge();
+  /**
+   * 一条工具条：左边是状态（点它开关面板、拖它挪位置），右边是动作键。
+   * 原来这四个是各吹各的胶囊，竖着摞成一摞互相挡，同一段玻璃样式还复制了四遍。
+   */
+  function ensureBar() {
+    let el = document.getElementById(BAR_ID);
+    if (el) return el;
+
+    el = mk("div", "crr-bar");
+    el.id = BAR_ID;
+    el.title = "点击展开面板 · 拖动可移动位置";
+
+    const stat = mk("span", "crr-stat");
+    stat.append(
+      mk("span", "crr-dot", "dot"),
+      mk("span", "crr-label", "st-label"),
+      mk("span", "crr-meter", "st-meter"),
+      mk("span", "crr-sub", "st-sub"),
+    );
+
+    const acts = mk("span", "crr-acts");
+    acts.append(
+      mkAction(CONT_BTN_ID, "继续", "发送「继续」（Ctrl+Alt+C 亦可）", () => sendContinueNow()),
+      mkAction(QUICK_BTN_ID, "接续", "新聊天并填入：读取{当前id}，继续（不自动发送）", () => quickNewChatResume()),
+      mkAction(SELF_HOST_ID, "自托管 关", "点击开关自托管（轮次结束后随机 30–300s 自动发「继续」）", () => {
+        CONFIG.selfHost = !CONFIG.selfHost;
+        saveSettings();
+        if (CONFIG.selfHost) {
+          state.selfHostHold = false;
+          armSelfHost("手动开启");
+          note("自托管已开启");
+        } else cancelSelfHost("已关闭");
+        paintBar();
+      }, "sh-dot"),
+    );
+
+    const caret = mk("span", "crr-caret", "caret");
+    caret.textContent = "▴";
+
+    el.append(stat, mk("span", "crr-div"), acts, caret);
+    attachDrag(el);
+    ensureHost().appendChild(el);
+    return el;
+  }
+
+  function paintBar() {
+    const el = ensureBar();
     const meta = STATUS_META[state.status] || STATUS_META.idle;
     const r = readRetry();
 
@@ -1804,70 +1853,67 @@
     if (!state.retrySession && state.engaged) bits.push("等活跃重试");
     const subText = bits.join(" · ");
 
-    const sig = `${state.status}|${meterText}|${subText}|${CONFIG.enabled}|${state.panelOpen}`;
-    if (sig === state.badgeSig) return;
-    state.badgeSig = sig;
+    const on = !!CONFIG.selfHost;
+    const left = state.selfHostAt ? Math.max(0, Math.round((state.selfHostAt - now()) / 1000)) : 0;
+    const shText = on ? (state.selfHostTimer ? `${left}s` : "待命") : "关";
+    const shColor = on ? (state.selfHostTimer ? C.good : C.wait) : C.neutral;
+
+    const sig = `${state.status}|${meterText}|${subText}|${CONFIG.enabled}|${state.panelOpen}|${shText}|${shColor}`;
+    if (sig === state.barSig) return;
+    state.barSig = sig;
 
     const dot = el.querySelector('[data-role="dot"]');
     dot.style.background = meta.dot;
     dot.style.boxShadow = CONFIG.enabled ? `0 0 6px ${meta.dot}99` : "none";
-    el.querySelector('[data-role="label"]').textContent = meta.label;
-    el.querySelector('[data-role="meter"]').textContent = meterText;
-    el.querySelector('[data-role="sub"]').textContent = subText;
-    el.querySelector('[data-role="caret"]').style.transform = state.panelOpen ? "rotate(180deg)" : "none";
+    el.querySelector('[data-role="st-label"]').textContent = meta.label;
+    el.querySelector('[data-role="st-meter"]').textContent = meterText;
+    el.querySelector('[data-role="st-sub"]').textContent = subText;
+    el.querySelector('[data-role="caret"]').dataset.open = state.panelOpen ? "1" : "0";
     el.style.opacity = CONFIG.enabled ? "1" : "0.5";
+
+    const shBtn = document.getElementById(SELF_HOST_ID);
+    const shDot = shBtn.querySelector('[data-role="sh-dot"]');
+    shDot.style.background = shColor;
+    shDot.style.boxShadow = on ? `0 0 6px ${shColor}99` : "none";
+    shBtn.querySelector('[data-role="btn-label"]').textContent = `自托管 ${shText}`;
+    shBtn.dataset.on = on ? "1" : "0";
   }
 
   // ---------------------------------------------------------------- 面板
-  const PANEL_CSS = {
-    row: "display:flex;align-items:center;justify-content:space-between;gap:10px;padding:3px 0",
-    key: "opacity:.5;font-size:11px;white-space:nowrap",
-    val: "font:600 11px ui-monospace,SFMono-Regular,Consolas,monospace;font-variant-numeric:tabular-nums;text-align:right",
-    sep: "height:1px;background:rgba(255,255,255,.09);margin:8px 0",
-    input: "width:64px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);"
-         + "border-radius:6px;color:#e8e8ea;padding:3px 6px;font:600 11px ui-monospace,Consolas,monospace;"
-         + "text-align:center;outline:none",
-    btn: "background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);border-radius:6px;"
-       + "color:#e8e8ea;width:20px;height:20px;line-height:1;cursor:pointer;font-size:12px;"
-       + "display:flex;align-items:center;justify-content:center;padding:0",
-    wide: "flex:1;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);border-radius:6px;"
-        + "color:#e8e8ea;padding:5px 8px;font:500 11px ui-sans-serif,sans-serif;cursor:pointer",
+  const mkGroup = text => {
+    const g = mk("div", "crr-group");
+    g.textContent = text;
+    return g;
   };
 
   function mkRow(keyText, valueNode) {
-    const row = document.createElement("div");
-    row.style.cssText = PANEL_CSS.row;
-    const k = document.createElement("span");
-    k.style.cssText = PANEL_CSS.key;
+    const row = mk("div", "crr-row");
+    const k = mk("span", "crr-key");
     k.textContent = keyText;
     row.append(k, valueNode);
     return row;
   }
 
-  function mkInfo(keyText, role) {
-    const v = document.createElement("span");
-    v.dataset.role = role;
-    v.style.cssText = PANEL_CSS.val;
+  function mkInfo(keyText, role, dim) {
+    const v = mk("span", "crr-val", role);
+    if (dim) v.dataset.dim = "1";
     return mkRow(keyText, v);
   }
 
   /** 数字步进器：减号 / 输入框 / 加号 */
   function mkStepper(keyText, role, { min, max, step, onSet }) {
-    const wrap = document.createElement("div");
-    wrap.style.cssText = "display:flex;align-items:center;gap:5px";
+    const wrap = mk("span", "crr-stat");
 
-    const dec = document.createElement("button");
-    dec.style.cssText = PANEL_CSS.btn;
+    const dec = mk("button", "crr-step");
+    dec.type = "button";
     dec.textContent = "−";
 
-    const input = document.createElement("input");
-    input.dataset.role = role;
+    const input = mk("input", "crr-input", role);
     input.type = "text";
     input.inputMode = "numeric";
-    input.style.cssText = PANEL_CSS.input;
 
-    const inc = document.createElement("button");
-    inc.style.cssText = PANEL_CSS.btn;
+    const inc = mk("button", "crr-step");
+    inc.type = "button";
     inc.textContent = "+";
 
     const apply = raw => {
@@ -1875,11 +1921,10 @@
       onSet(v);
       input.value = String(v);
       saveSettings();
-      state.panelSig = "";   // 强制下一帧重画
       paintPanel();
     };
-    dec.addEventListener("click", e => { e.stopPropagation(); apply(parseInt(input.value, 10) - step); });
-    inc.addEventListener("click", e => { e.stopPropagation(); apply(parseInt(input.value, 10) + step); });
+    dec.addEventListener("click", () => apply(parseInt(input.value, 10) - step));
+    inc.addEventListener("click", () => apply(parseInt(input.value, 10) + step));
     input.addEventListener("change", () => apply(input.value));
     input.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); apply(input.value); input.blur(); } });
 
@@ -1891,57 +1936,38 @@
     let p = document.getElementById(PANEL_ID);
     if (p) return p;
 
-    p = document.createElement("div");
+    p = mk("div", "crr-panel");
     p.id = PANEL_ID;
-    p.style.cssText = [
-      "width:236px", "padding:12px 13px", "border-radius:12px",
-      "font:500 11.5px/1.5 ui-sans-serif,-apple-system,'Segoe UI',sans-serif",
-      "color:#e8e8ea", "background:rgba(24,24,27,.92)",
-      "backdrop-filter:blur(14px)", "-webkit-backdrop-filter:blur(14px)",
-      "border:1px solid rgba(255,255,255,.12)",
-      "box-shadow:0 10px 34px rgba(0,0,0,.42)",
-      "user-select:none", "pointer-events:auto",
-    ].join(";");
-    // 面板内部的点击不要冒泡到 badge，否则一点就折叠
-    p.addEventListener("click", e => e.stopPropagation());
-    // 也别让面板上的拖动手势被当成移动指示器
-    p.addEventListener("pointerdown", e => e.stopPropagation());
 
     // ---- 头部：标题 + 启用开关 ----
-    const head = document.createElement("div");
-    head.style.cssText = "display:flex;align-items:center;justify-content:space-between;margin-bottom:9px";
-    const title = document.createElement("span");
-    title.style.cssText = "font-weight:600;font-size:12px";
+    const head = mk("div", "crr-head");
+    const title = mk("span", "crr-title");
     title.textContent = "重试救援";
-    const toggle = document.createElement("button");
-    toggle.dataset.role = "toggle";
-    toggle.style.cssText = PANEL_CSS.btn + ";width:auto;padding:0 9px;height:22px;font-size:11px";
-    toggle.addEventListener("click", e => {
-      e.stopPropagation();
+    const toggle = mk("button", "crr-btn", "toggle");
+    toggle.type = "button";
+    toggle.addEventListener("click", () => {
       CONFIG.enabled = !CONFIG.enabled;
       saveSettings();
       note(CONFIG.enabled ? "已恢复" : "已暂停");
-      state.panelSig = ""; state.badgeSig = "";
-      paintPanel(); paintBadge();
+      paintBar(); paintPanel();
     });
     head.append(title, toggle);
 
-    // ---- 信息区 ----
-    const info = document.createElement("div");
+    const info = mk("div");
     info.append(
+      mkGroup("概览"),
       mkInfo("状态", "i-status"),
       mkInfo("重试", "i-retry"),
       mkInfo("已救轮数", "i-rounds"),
       mkInfo("会话", "i-armed"),
       mkInfo("内容", "i-flow"),
+      mkInfo("自托管", "i-self"),
     );
 
-    const sep1 = document.createElement("div");
-    sep1.style.cssText = PANEL_CSS.sep;
-
-    // ---- 设置区 ----
-    const settings = document.createElement("div");
+    // ---- 参数区 ----
+    const settings = mk("div");
     settings.append(
+      mkGroup("参数"),
       mkStepper("最大轮数", "s-rounds", {
         min: 1, max: 999, step: 5, onSet: v => { CONFIG.maxRounds = v; },
       }),
@@ -1954,10 +1980,9 @@
     );
 
     // 续跑提示词
-    const textIn = document.createElement("input");
-    textIn.dataset.role = "s-text";
+    const textIn = mk("input", "crr-input", "s-text");
     textIn.type = "text";
-    textIn.style.cssText = PANEL_CSS.input + ";width:86px;text-align:left;font-family:inherit";
+    textIn.dataset.wide = "1";
     const commitText = () => {
       const v = textIn.value.trim();
       if (v) { CONFIG.continueText = v; saveSettings(); }
@@ -1967,55 +1992,25 @@
     textIn.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); commitText(); textIn.blur(); } });
     settings.append(mkRow("续跑提示词", textIn));
 
-    // 阈值只读展示：它是逻辑正确性的一部分，不开放修改
-    const thr = document.createElement("span");
-    thr.style.cssText = PANEL_CSS.val + ";opacity:.55";
-    thr.textContent = CONFIG.thresholds.map(t => `第${t}次失败后`).join(" / ");
-    settings.append(mkRow("打断阈值", thr));
+    // 打断阈值只读展示：它是逻辑正确性的一部分，不开放修改
+    settings.append(mkInfo("打断阈值", "i-threshold", true));
 
-    const sep2 = document.createElement("div");
-    sep2.style.cssText = PANEL_CSS.sep;
-
-    // ---- 操作 ----
-    const selfBtn = document.createElement("button");
-    selfBtn.dataset.role = "s-selfhost";
-    selfBtn.style.cssText = PANEL_CSS.wide;
-    selfBtn.addEventListener("click", e => {
-      e.stopPropagation();
-      CONFIG.selfHost = !CONFIG.selfHost;
-      saveSettings();
-      if (!CONFIG.selfHost) cancelSelfHost("已关闭");
-      else {
-        state.selfHostHold = false;
-        armSelfHost("手动开启");
-      }
-      note(CONFIG.selfHost ? "自托管已开启" : "自托管已关闭");
-      state.panelSig = ""; state.badgeSig = "";
-      paintPanel(); paintBadge();
-    });
-
-    const reset = document.createElement("button");
-    reset.style.cssText = PANEL_CSS.wide;
+    const foot = mk("div", "crr-foot");
+    const reset = mk("button", "crr-wide");
+    reset.type = "button";
     reset.textContent = "重置轮数计数";
-    reset.addEventListener("click", e => {
-      e.stopPropagation();
+    reset.addEventListener("click", () => {
       state.round = 0;
       endRetrySession("手动重置");
       note("轮数计数已重置");
-      state.panelSig = ""; state.badgeSig = "";
-      paintPanel(); paintBadge();
+      paintBar(); paintPanel();
     });
+    foot.append(reset);
 
-    const sep3 = document.createElement("div");
-    sep3.style.cssText = PANEL_CSS.sep;
+    const logBox = mk("div", "crr-log", "log");
 
-    const logBox = document.createElement("div");
-    logBox.dataset.role = "log";
-    logBox.style.cssText = "font:400 10px/1.55 ui-monospace,Consolas,monospace;opacity:.45;"
-      + "max-height:56px;overflow:hidden;white-space:pre-wrap;word-break:break-all";
-
-    p.append(head, info, sep1, settings, sep2, selfBtn, reset, sep3, logBox);
-    ensureHost().prepend(p);   // 面板在指示器上方
+    p.append(head, info, settings, foot, logBox);
+    ensureHost().prepend(p);   // 面板在工具条上方
     return p;
   }
 
@@ -2025,6 +2020,8 @@
     const r = readRetry();
     const isFlowing = flowing(state, CONFIG);
 
+    const on = !!CONFIG.selfHost;
+    const left = state.selfHostAt ? Math.max(0, Math.round((state.selfHostAt - now()) / 1000)) : 0;
     const vals = {
       "i-status": (STATUS_META[state.status] || STATUS_META.idle).label,
       "i-retry": r ? `${r.n}/${r.max}` : "—",
@@ -2035,6 +2032,8 @@
           ? (state.retrySession ? (state.armed ? "活跃" : "跟踪中") : "残留/空闲")
           : "耗尽续跑",
       "i-flow": isFlowing ? "流动中" : "静默",
+      "i-self": on ? (state.selfHostTimer ? `开 · ${left}s` : "开 · 待命") : "关",
+      "i-threshold": `第 ${CONFIG.thresholds.join("/")} 次失败后`,
     };
     const logText = state.log.slice(-3).reverse().join("\n");
     const sig = JSON.stringify(vals) + "|" + logText + "|" + CONFIG.enabled
@@ -2051,7 +2050,7 @@
 
     const toggle = p.querySelector('[data-role="toggle"]');
     toggle.textContent = CONFIG.enabled ? "已启用" : "已暂停";
-    toggle.style.color = CONFIG.enabled ? "#22c55e" : "#8b8b8b";
+    toggle.dataset.on = CONFIG.enabled ? "1" : "0";
 
     // 输入框正在被编辑时不要覆盖，否则没法打字
     const setIfIdle = (role, value) => {
@@ -2061,24 +2060,15 @@
     setIfIdle("s-rounds", CONFIG.maxRounds);
     setIfIdle("s-quiet", CONFIG.quietMs);
     setIfIdle("s-idle", CONFIG.sessionIdleMs);
-    setIfIdle("s-self", Math.round((CONFIG.selfHostDelayMs[0] + CONFIG.selfHostDelayMs[1]) / 2));
     setIfIdle("s-text", CONFIG.continueText);
-
-    const selfBtn = p.querySelector('[data-role="s-selfhost"]');
-    if (selfBtn) {
-      selfBtn.textContent = CONFIG.selfHost
-        ? `自托管：开（${state.selfHostAt ? Math.max(0, Math.round((state.selfHostAt - now()) / 1000)) + "s" : "待命"}）`
-        : "自托管：关（点此开启）";
-    }
   }
 
   function togglePanel() {
     state.panelOpen = !state.panelOpen;
     const p = state.panelOpen ? ensurePanel() : document.getElementById(PANEL_ID);
-    if (p) p.style.display = state.panelOpen ? "block" : "none";
-    state.panelSig = ""; state.badgeSig = "";
+    if (p) p.hidden = !state.panelOpen;
     if (state.panelOpen) paintPanel();
-    paintBadge();
+    paintBar();
     applyPos();   // 展开后容器变高，重新夹一次免得顶出屏幕
   }
 
@@ -2094,8 +2084,8 @@
   const pulse = () => {
     try {
       tick();
-      paintBadge();
-      paintSelfHost();
+      refreshTheme();
+      paintBar();
       paintPanel();
     } catch (e) {
       try { note(`pulse 异常已忽略: ${e.message || e}`); } catch (_) { /* ignore */ }
@@ -2138,9 +2128,7 @@
   }
 
   startClocks();
-  paintBadge();
-  state.onHotkey = onHotkey;
-  window.addEventListener?.("keydown", state.onHotkey, true);
+  paintBar();
 
   // 只把「在输入框打字」当人工：滑动对话、点空白都不该碰自托管。
   // 取消后置 hold，避免下一拍 send 分支又 arm，看起来像读秒被重置。
@@ -2231,9 +2219,8 @@
       document.removeEventListener?.("input", state.onComposerHuman, true);
       document.removeEventListener?.("keydown", state.onComposerHuman, true);
     }
-    document.getElementById(HOST_ID)?.remove();   // 连带移除面板和指示器
-    document.getElementById(BADGE_ID)?.remove();
-    document.getElementById(PANEL_ID)?.remove();
+    document.getElementById(HOST_ID)?.remove();   // 连带移除面板和工具条
+    document.getElementById(STYLE_ID)?.remove();
     console.log("[retry-rescue] destroyed");
   }
 
