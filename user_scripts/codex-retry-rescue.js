@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Codex Retry Rescue
-// @version      0.11.0
+// @version      0.11.1
 // @description  Codex 断流/限流/会话死亡自动救援：重试逼近上限时打断并继续刷新预算，400 类死会话自动开新对话接续，带状态条与后台看门狗
 // ==/UserScript==
 //
@@ -188,6 +188,10 @@
     sessionLastNAt: 0,    // 最近一次观测到次数变化/新活跃行的时间
     seenN: new Map(),     // el -> 上次读到的 n，用来识别「次数爬升」
     staleEls: new WeakSet(), // 已确认是历史残留 / 已处理过的行
+    // 本轮「重试打满」的证据。必须是 turn 级的：10/10 之后再也不会爬升，
+    // 若只挂在 activeRetryEl 上，sessionIdleMs 空闲超时会先把它清掉，
+    // 等按钮回到发送态（真正该续跑的时刻）判定已经失效了。
+    turnExhausted: null,
     prevBtnKind: null,    // 识别 turn 边界（send/continue -> stop）
     status: "idle",
     panelOpen: false,
@@ -415,12 +419,44 @@
     return readRetryFrom(retryCandidates());
   }
 
+  /**
+   * 错误文案叶节点（限流 / 会话已死）。
+   * 这里故意不要求它在 aside 容器里 —— 同一段报错在界面上会出现两份（错误框里一份、
+   * 会话条目里一份），只要像报错文案就不该算成模型产出。容器约束是给 400 迁移用的
+   * （那边认错代价是乱开新聊天），这边漏扣一百字最多让「没产出」更容易成立。
+   *
+   * 不缓存：报错框出现的那一拍必须同时把它从长度里扣掉。缓存过期会让 len 先跳一百多字
+   * 再落回去，而那一跳正好足够把「本轮耗尽证据」误判成「已产出」永久清掉。
+   * 实测整棵对话树扫一遍约 1ms，而调用方 threadLenFrom 本身已有 500ms 缓存。
+   */
+  function isErrorTextLeaf(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.id === HOST_ID || el.closest?.(`#${HOST_ID}`)) return false;
+    const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+    if (!t || t.length > 400) return false;
+    if (!FATAL_ERR_RE.test(t) && !RATE_LIMIT_RE.test(t)) return false;
+    return ![...el.children].some(c => {
+      const s = c.textContent || "";
+      return FATAL_ERR_RE.test(s) || RATE_LIMIT_RE.test(s);
+    });
+  }
+
+  function errorTextLeaves() {
+    const out = [];
+    const root = threadRoot();
+    if (!root) return out;
+    for (const el of root.querySelectorAll("span, div, aside, pre, code")) {
+      if (isErrorTextLeaf(el)) out.push(el);
+    }
+    return out;
+  }
+
   function subtractTextLen(root, el) {
     if (!root || !el || !root.contains(el)) return 0;
     return (el.textContent || "").length;
   }
 
-  /** 对话区文本长度。排除重试状态行和脚本自身 UI，否则它们的滚动文本会被误判为输出 */
+  /** 对话区文本长度。排除重试状态行、错误文案和脚本自身 UI，否则它们的滚动文本会被误判为输出 */
   function threadLenFrom(cands) {
     const t = now();
     if (state.lenCacheAt && t - state.lenCacheAt < 500) return state.lenCache;
@@ -430,6 +466,7 @@
     const ignored = new Set(cands);
     ignored.add(document.getElementById(HOST_ID));
     ignored.add(findComposer());
+    for (const el of errorTextLeaves()) ignored.add(el);
     for (const el of ignored) len -= subtractTextLen(root, el);
     state.lenCache = Math.max(0, len);
     state.lenCacheAt = t;
@@ -867,6 +904,8 @@
     if (state.busy) return;
     state.busy = true;
     state.status = "acting";
+    // 证据只消费一次：续跑失败也不重复轰炸，交给「脱离接管」那条路
+    state.turnExhausted = null;
     try {
       state.round++;
       note(`第 ${state.round} 轮：重试已耗尽并报错，用续跑提示词重新触发`);
@@ -1297,6 +1336,7 @@
       clearConfirmWindow();
       cancelSelfHost("新 turn 开始");
       state.selfHostHold = false;   // 新一轮结束后允许再排期
+      state.turnExhausted = null;   // 上一轮的耗尽证据随 turn 作废
       markCurrentFatalsResidual();
     }
     // 会话切换：你手动点开别的对话（含历史报错对话）时，整段 turn 状态必须清零。
@@ -1310,6 +1350,7 @@
       endRetrySession("切换会话");
       clearConfirmWindow();
       cancelSelfHost("切换会话");
+      state.turnExhausted = null;
       markCurrentFatalsResidual();   // 新会话里已有的 400 全是残留
     }
     if (nowTid) state.currentThreadId = nowTid;
@@ -1331,12 +1372,30 @@
       endRetrySession("次数长时间未爬升");
     }
 
+    // 打满之后真的开始出字了 → 那一发是成功的，本轮不需要收尸。
+    // 注意这条不受 endRetrySession 影响：turnExhausted 是 turn 级的。
+    if (state.turnExhausted && state.len - state.turnExhausted.len >= CONFIG.growthEpsilon) {
+      note("打满后已有实质产出，本轮不续跑");
+      state.turnExhausted = null;
+    }
+
     if (st.kind === "stop") {
       const prevSeenN = reading && state.seenN.has(reading.el) ? state.seenN.get(reading.el) : undefined;
       const active = updateRetryActivity(reading);
       const isFlowing = flowing(state, CONFIG);
       const rateLimited = rateLimitVisible();
       if (rateLimited) state.sawRateLimitAt = now();
+
+      // 打满必须在还看得见这条行时记成证据：10/10 之后次数永远不再爬升，
+      // 30 秒后它就会被上面的空闲超时当成残留清掉，而那时按钮还没回到发送态。
+      if (reading && reading.n >= reading.max && state.activeRetryEl === reading.el) {
+        if (state.turnExhausted && state.turnExhausted.el === reading.el) {
+          state.turnExhausted.at = now();
+        } else {
+          state.turnExhausted = { el: reading.el, n: reading.n, max: reading.max, at: now(), len: state.len };
+          note(`第 ${reading.n}/${reading.max} 打满：记下耗尽证据，等 turn 结束再决定续跑`);
+        }
+      }
 
       // n 上跳 = 上一发失败已证实（允许跳号，如 7→10）
       const nIncreased = reading && prevSeenN !== undefined && reading.n > prevSeenN;
@@ -1421,13 +1480,13 @@
       }
 
       // 耗尽判定（不依赖 engaged —— 0.9 起我们通常没预防性打断过）：
-      //   1. 必须是本轮运行时看到的那条重试行（不是历史残留）
-      //   2. n 打满（10/10）
-      //   3. 重试开始后没吐过实质正文 —— 区分「第 10 次成功」和「耗尽报错」
-      const exhausted = reading
-        && reading.el === state.activeRetryEl
-        && reading.n >= reading.max
-        && !producedSinceRetry(state, CONFIG);
+      //   1. 本轮活跃重试行曾经真的打满（turnExhausted，运行期记下的证据）
+      //   2. 打满到现在没有实质正文 —— 区分「第 10 次成功」和「耗尽报错」
+      // 早先这里是 reading.el === state.activeRetryEl && n >= max，永远等不到：
+      // 打满后次数不再爬升，空闲超时先把会话结束掉、activeRetryEl 清空，
+      // 等按钮回到发送态时条件已经不成立（错误框文案还会被误判成产出）。
+      const exhausted = !!state.turnExhausted
+        && state.len - state.turnExhausted.len < CONFIG.growthEpsilon;
 
       if (exhausted && state.round < CONFIG.maxRounds) {
         state.status = "exhausted";
