@@ -70,6 +70,7 @@ export function Path() {
                 { t: "新出现的错误框 + 本 turn 跑起来过", d: "历史残留一律忽略" },
                 { t: "错误框连续存在 8 秒", d: "期间打字或切会话立刻取消" },
                 { t: "本轮重试打满且没产出", d: "同会话发一句「继续」" },
+                { t: "本轮新撞限流框 + 之后零产出", d: "立刻发「继续」，不排读秒" },
                 { t: "有产出后正常收尾", d: "脱离接管，排自托管读秒" },
               ]}
               action="会话死亡 → 开新聊天接续；否则不动"
@@ -157,9 +158,9 @@ export function KeepAlive() {
         <div className="mt-12 grid grid-cols-1 gap-10 lg:mt-16 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)] lg:gap-14">
           <div>
             <DefRow term="setInterval + Worker" desc="主循环 700ms 一拍；页面 hidden 时才让 Worker 补拍，避免前台双打。" />
-            <DefRow term="visibilitychange" desc="回到前台立刻补一拍，并重算状态条位置（最小化时几何会塌成 0×0）。" />
+            <DefRow term="visibilitychange" desc="回到前台立刻补一拍，并重算工具条位置（最小化时几何会塌成 0×0）。" />
             <DefRow term="codex-retry-watchdog.mjs" desc="独立 Node 进程，连 Codex++ 开的调试端口，每 2 秒 Runtime.evaluate 推一次 kick()。顺带开 Focus Emulation 减轻限流。" />
-            <DefRow term="/ping 探活" desc="看门狗在 127.0.0.1:57328 报活；脚本只探测、不自动拉起，探不到就在状态条显示「看门狗✗」。" />
+            <DefRow term="/ping 探活" desc="看门狗在 127.0.0.1:57328 报活；脚本只探测、不自动拉起，探不到就在工具条显示「看门狗✗」。" />
             <div className="mt-8">
               <CodeBlock label="开一个最小化的看门狗" code={WATCHDOG_CMD} />
             </div>
@@ -338,7 +339,7 @@ export function SelfHost() {
             num="08"
             en="unattended"
             title="无人值守：让它自己接下一轮"
-            lead="开启后，每轮正常结束进入待命就开始读秒；到点等价于替你点一次「继续」。你在输入框打字、切会话、开新一轮 → 取消本轮，等下一轮结束再排。滑动屏幕和点空白不算干预。"
+            lead="开启后，每轮正常结束进入待命就开始读秒；到点等价于替你点一次「继续」。你在输入框打字、切会话、开新一轮 → 取消本轮，等下一轮结束再排。滑动屏幕和点空白不算干预。撞到限流并停下不走这条——那种情况立刻续跑。"
           />
           <Reveal>
             <figure className="border border-rule bg-paper-2 p-5 lg:p-7">
@@ -360,7 +361,7 @@ export function SelfHost() {
                 ))}
               </div>
               <p className="mono-label !normal-case mt-5 border-t border-rule-soft pt-3">
-                中位 77s · 均值 107s · p90 237s —— 对小秒数加权，避免固定节奏
+                中位 78s · 均值 107s · p90 238s —— 对小秒数加权，避免固定节奏
               </p>
             </figure>
           </Reveal>

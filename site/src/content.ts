@@ -1,7 +1,7 @@
 // 站点文案与数据。数字都与仓库里的 docs/DESIGN.md、README.md 对齐，改一处要改两处。
 
 export const META = {
-  version: "0.11.0",
+  version: "0.13.0",
   repo: "https://github.com/vg188/codex-retry-rescue",
   issues: "https://github.com/vg188/codex-retry-rescue/issues",
   designDoc: "https://github.com/vg188/codex-retry-rescue/blob/main/docs/DESIGN.md",
@@ -41,9 +41,9 @@ export const FAULTS = [
     idx: "02",
     name: "限流",
     ui: "rate limit exceeded … token rate limit",
-    verdict: "不打断，等耗尽后再发一句",
-    body: "限流和通道满是两回事。打断再继续等于在限流上又叠一次请求，只会让窗口更长。这类错误命中后，脚本一条都做不了——不点停止、不点继续、不开新聊天，只观察。",
-    detail: "等 Codex 自己把 10 次跑完、按钮回到「发送」，再在同一会话里发一句「继续」。限流文案常常在验收窗中途才刷出来，所以它是一票否决：动手前还要再查一次。",
+    verdict: "不打断；它一停下就立刻发一句",
+    body: "限流和通道满是两回事。打断再继续等于在限流上又叠一次请求，只会让窗口更长。所以运行期间脚本不点停止、不开新聊天，只观察这一轮什么时候散场。",
+    detail: "本轮新弹出一个报错框、之后没有任何实质产出、并且本轮真的跑起来过——三条同时成立才发「继续」，不排自托管读秒。缺一条都不动手：界面上看得到旧报错框不算证据，那样点开任何一条历史限流会话都会被当成故障。",
   },
   {
     idx: "03",
@@ -66,8 +66,9 @@ export const GUARDRAILS = [
 
 export const CONFIG_ROWS = [
   { k: "enabled", d: "true", v: "总开关" },
-  { k: "enablePreventiveRescue", d: "true", v: "是否允许预防性打断；关掉就只等耗尽后续跑" },
+  { k: "enablePreventiveRescue", d: "true", v: "是否允许预防性打断；关掉就只等停下后续跑" },
   { k: "skipPreventiveOnRateLimit", d: "true", v: "限流时跳过打断" },
+  { k: "rateLimitImmediate", d: "true", v: "本轮撞限流停下后立刻续跑，不等读秒" },
   { k: "thresholds", d: "[7, 8, 9]", v: "每轮随机抽临界次数，避免固定节奏" },
   { k: "confirmWindowMs", d: "[3000, 4000]", v: "跳号后给新一发证明自己的窗口" },
   { k: "settleMs", d: "[200, 600]", v: "确认失败后的落稳" },
@@ -94,14 +95,14 @@ export const PLATFORM_ROWS = [
   { k: "fatalContainers", what: "错误框的 DOM 特征，命中才算错误框", d: "aside,.wrap-anywhere" },
 ];
 
-/** 自托管读秒的实测分布（skew=2.5，20 万次抽样） */
+/** 自托管读秒的实测分布（skew=2.5，40 万次抽样） */
 export const SELFHOST_BUCKETS = [
-  { range: "30–60s", pct: 41.6 },
+  { range: "30–60s", pct: 41.5 },
   { range: "60–90s", pct: 13.3 },
-  { range: "90–120s", pct: 9.7 },
+  { range: "90–120s", pct: 9.6 },
   { range: "120–180s", pct: 14.6 },
   { range: "180–240s", pct: 11.4 },
-  { range: "240–300s", pct: 9.4 },
+  { range: "240–300s", pct: 9.6 },
 ];
 
 export type InstallStep = {
@@ -130,7 +131,7 @@ export const INSTALL_STEPS: InstallStep[] = [
   {
     idx: "03",
     title: "热重载",
-    body: "右下角出现状态条就算注入成功。它会开始记录每一拍的判定，日志在面板里。",
+    body: "右下角出现一条工具条就算注入成功。左边是状态、右边是动作键，日志在展开的面板里。",
     code: null,
     lang: null,
   },
