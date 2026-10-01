@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Codex Retry Rescue
-// @version      0.13.0
+// @version      0.13.1
 // @description  Codex 断流/限流/会话死亡自动救援：重试逼近上限时打断并继续刷新预算，400 类死会话自动开新对话接续，带状态条与后台看门狗
 // ==/UserScript==
 //
@@ -1548,10 +1548,13 @@
       }
 
       if (!state.engaged) {
+        // 只有本轮真的跑过才排读秒。点开一条新会话（例如「创建新项目」）时按钮一直是
+        // 发送态，每拍都会走到这里 —— 不加这道闸，脚本就会自己往空会话里发「继续」。
+        const ranTurn = state.sawRunningTurn;
         state.status = "idle";
         state.sawRunningTurn = false;
         if (state.retrySession) endRetrySession("回到发送态且未接管");
-        armSelfHostOnceOnIdle("输出结束，进入待命");
+        if (ranTurn) armSelfHostOnceOnIdle("输出结束，进入待命");
         return;
       }
 
