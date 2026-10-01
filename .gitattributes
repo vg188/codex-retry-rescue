@@ -1,0 +1,10 @@
+# Windows 上跑的启动脚本必须是 CRLF，否则 cmd 解析会出问题
+* text=auto
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.js text
+*.mjs text
+*.md text
+*.json text
+*.png binary
+*.jpg binary

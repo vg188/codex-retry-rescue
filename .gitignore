@@ -1,0 +1,17 @@
+# 本地依赖与产物
+node_modules/
+*.tgz
+package-lock.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志与临时探测
+*.log
+_probe*.mjs
+_scratch/
+*.bak
