@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Codex Retry Rescue
-// @version      0.12.0
+// @version      0.13.0
 // @description  Codex 断流/限流/会话死亡自动救援：重试逼近上限时打断并继续刷新预算，400 类死会话自动开新对话接续，带状态条与后台看门狗
 // ==/UserScript==
 //
@@ -21,6 +21,9 @@
 //   * high demand / 上游地址失败 / 一般重连 → 仍做预防性打断（跳号+验收窗）
 //   * rate limit / token rate limit / 429  → 不做预防性打断，等 10/10 耗尽再发「继续」
 //     （限流时打断+继续等于继续加请求，等耗尽更稳）
+//   * 0.13 起：限流把这一轮停住后立刻发「继续」，不再排自托管读秒。判据是「本轮
+//     新弹出一个报错框 + 之后没有任何实质产出 + 本轮真的跑过」，缺一条都不动手，
+//     免得点开一条历史限流会话就被当成故障。
 //
 // 实测要点（都是踩过的坑，改动前先读）：
 //   * 重试次数是滚动数字动画，textContent 读出来是 "0123456789"，真值在
@@ -64,8 +67,10 @@
   const CONFIG = {
     // 预防性打断（high demand / 上游断流）：跳号 + 验收窗 + 随机临界
     enablePreventiveRescue: true,
-    // rate limit 时禁止预防性打断，只等 10/10 耗尽后发「继续」
+    // rate limit 时禁止预防性打断，只等耗尽后发「继续」
     skipPreventiveOnRateLimit: true,
+    // 本轮确实撞到限流、且已停止 → 立刻发「继续」，不等自托管读秒
+    rateLimitImmediate: true,
     thresholds: [7, 8, 9],
     confirmWindowMs: [3000, 4000],
     settleMs: [200, 600],
@@ -248,7 +253,12 @@
     confirmLen: 0,
     confirmN: 0,
     confirming: false,
-    sawRateLimitAt: 0,
+    // 本轮「新撞到限流」的证据。基准 = 已经算过的历史报错框数量，数量变多才是这一轮
+    // 又弹了一个；只凭「界面上看得到限流文案」不行 —— 报错框会永久留在 transcript 里，
+    // 那样点开任何一条旧限流会话都会被当成故障。撞框后又出了正文就把证据作废。
+    rateLimitBase: 0,
+    rateLimitHit: null,   // { len }：撞框那一刻的对话区长度（已扣除报错文案）
+    rlLeaves: 0,          // 最近一次长度扫描数到的限流文案叶节点数
   };
 
   function note(msg) {
@@ -464,12 +474,18 @@
     const t = now();
     if (state.lenCacheAt && t - state.lenCacheAt < 500) return state.lenCache;
     const root = threadRoot();
-    if (!root) { state.lenCache = 0; state.lenCacheAt = t; return 0; }
+    if (!root) { state.lenCache = 0; state.lenCacheAt = t; state.rlLeaves = 0; return 0; }
     let len = (root.textContent || "").length;
     const ignored = new Set(cands);
     ignored.add(document.getElementById(HOST_ID));
     ignored.add(findComposer());
-    for (const el of errorTextLeaves()) ignored.add(el);
+    // 顺手数一下限流文案有几份：这次扫描本来就要遍历这些叶子，不再另开一遍
+    let rl = 0;
+    for (const el of errorTextLeaves()) {
+      ignored.add(el);
+      if (RATE_LIMIT_RE.test((el.textContent || "").replace(/\s+/g, " ").trim())) rl++;
+    }
+    state.rlLeaves = rl;
     for (const el of ignored) len -= subtractTextLen(root, el);
     state.lenCache = Math.max(0, len);
     state.lenCacheAt = t;
@@ -643,6 +659,19 @@
       state.rateLimitCache = false;
     }
     return state.rateLimitCache;
+  }
+
+  /**
+   * 每拍跟一次限流报错框的数量：比基准多 = 这一轮新撞了一个，记下当时的长度作为证据。
+   * 基准跟着数量下调 —— 虚拟滚动会把旧框摘掉，不降就会永远等不到「变多」。
+   */
+  function trackRateLimitBoxes() {
+    const n = state.rlLeaves;
+    if (n < state.rateLimitBase) state.rateLimitBase = n;
+    if (n > state.rateLimitBase) {
+      state.rateLimitBase = n;
+      state.rateLimitHit = { len: state.len };
+    }
   }
 
   /**
@@ -896,15 +925,16 @@
     return true;
   }
 
-  async function handleExhausted(reading) {
+  async function handleExhausted(reading, reason) {
     if (state.busy) return;
     state.busy = true;
     state.status = "acting";
     // 证据只消费一次：续跑失败也不重复轰炸，交给「脱离接管」那条路
     state.turnExhausted = null;
+    state.rateLimitHit = null;
     try {
       state.round++;
-      note(`第 ${state.round} 轮：重试已耗尽并报错，用续跑提示词重新触发`);
+      note(`第 ${state.round} 轮：${reason || "重试已耗尽并报错"}，立即用续跑提示词重新触发`);
       state.armed = false;
       state.actedRetryEl = reading ? reading.el : null;
       // 注意：不要再写 Infinity —— 旧逻辑 shouldRearm 用 n < actedAtN 判断，
@@ -1325,6 +1355,9 @@
     if (!CONFIG.enabled) { state.status = "paused"; return; }
     if (state.busy) return;
 
+    // 限流报错框的「本轮新撞」判定要在任何分支之前先跟一遍
+    trackRateLimitBoxes();
+
     // turn 边界：上一拍还不是 stop（send/继续/未知）现在变 stop = 新的一轮开始了。
     // 此时把现存重试行/历史错误全部打成残留，避免上一轮的计数或旧 400 进入本轮判定。
     if (st.kind === "stop" && state.prevBtnKind !== null && state.prevBtnKind !== "stop") {
@@ -1333,6 +1366,8 @@
       cancelSelfHost("新 turn 开始");
       state.selfHostHold = false;   // 新一轮结束后允许再排期
       state.turnExhausted = null;   // 上一轮的耗尽证据随 turn 作废
+      state.rateLimitHit = null;
+      state.rateLimitBase = state.rlLeaves;   // 本轮开始就存在的框，全部算历史
       markCurrentFatalsResidual();
     }
     // 会话切换：你手动点开别的对话（含历史报错对话）时，整段 turn 状态必须清零。
@@ -1347,6 +1382,12 @@
       clearConfirmWindow();
       cancelSelfHost("切换会话");
       state.turnExhausted = null;
+      // 新会话里已有的报错框全是历史，基准必须按新 DOM 重扫一遍再定，
+      // 否则「一进来就数到 3 个框」会被当成刚撞上限流。
+      state.lenCacheAt = 0;
+      state.len = threadLen();
+      state.rateLimitHit = null;
+      state.rateLimitBase = state.rlLeaves;
       markCurrentFatalsResidual();   // 新会话里已有的 400 全是残留
     }
     if (nowTid) state.currentThreadId = nowTid;
@@ -1375,12 +1416,16 @@
       state.turnExhausted = null;
     }
 
+    // 撞框之后又出了实质正文 → 那一发是连上的，不是收尸现场
+    if (state.rateLimitHit && state.len - state.rateLimitHit.len >= CONFIG.growthEpsilon) {
+      state.rateLimitHit = null;
+    }
+
     if (st.kind === "stop") {
       const prevSeenN = reading && state.seenN.has(reading.el) ? state.seenN.get(reading.el) : undefined;
       const active = updateRetryActivity(reading);
       const isFlowing = flowing(state, CONFIG);
       const rateLimited = rateLimitVisible();
-      if (rateLimited) state.sawRateLimitAt = now();
 
       // 打满必须在还看得见这条行时记成证据：10/10 之后次数永远不再爬升，
       // 30 秒后它就会被上面的空闲超时当成残留清掉，而那时按钮还没回到发送态。
@@ -1487,6 +1532,18 @@
       if (exhausted && state.round < CONFIG.maxRounds) {
         state.status = "exhausted";
         handleExhausted(reading);
+        return;
+      }
+
+      // 本轮新撞到限流、之后没有任何实质产出、并且已经停下 → 立刻续跑，不排自托管读秒。
+      // 上面那条打满判定要求「看见过 10/10 这一行」，而限流经常是请求直接被打回、
+      // 重连行还没冒出来（或被虚拟滚动摘掉）就已经停在发送态，于是只能干等读秒。
+      // sawRunningTurn 是必需的闸：点开一条历史限流会话时按钮一直是发送态，
+      // 滚动让旧框重新挂载也会让数量变多，只有「本轮真的跑过」才允许动手。
+      if (CONFIG.rateLimitImmediate && state.rateLimitHit && state.sawRunningTurn
+          && state.round < CONFIG.maxRounds) {
+        state.status = "exhausted";
+        handleExhausted(reading, "本轮撞上限流且已停止");   // 证据在这里消费掉
         return;
       }
 
@@ -2027,7 +2084,7 @@
       "i-retry": r ? `${r.n}/${r.max}` : "—",
       "i-rounds": `${state.round} / ${CONFIG.maxRounds}`,
       "i-armed": rateLimitVisible()
-        ? "限流·耗尽续跑"
+        ? "限流·不打断"
         : CONFIG.enablePreventiveRescue
           ? (state.retrySession ? (state.armed ? "活跃" : "跟踪中") : "残留/空闲")
           : "耗尽续跑",
@@ -2079,6 +2136,7 @@
   // 8/10」或历史 400 会在第一拍就被当成新状况，误触发。
   markAllRetriesStale();
   markCurrentFatalsResidual();
+  state.rateLimitBase = state.rlLeaves;   // 启动时就存在的限流框全是历史
   state.currentThreadId = readCurrentThreadId();
 
   const pulse = () => {
