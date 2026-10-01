@@ -1,0 +1,169 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------- 字体自托管
+   国内访问 Google Fonts / gstatic 不稳，全部 woff2 随产物一起发，运行时零外部请求。
+   中文不下载字体：标题落本机衬线（思源宋体 / 宋体），正文落本机无衬线。 */
+@font-face {
+  font-family: "Instrument Serif";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/instrument-serif-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Instrument Serif";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/instrument-serif-latin-400-italic.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-sans-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-sans-latin-500-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-sans-latin-600-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-latin-500-normal.woff2") format("woff2");
+}
+
+@theme {
+  /* 暖白纸面 + 墨黑 + 单一救援橙。绿色只用来表示「连上了」，不参与装饰。 */
+  --color-paper: #fbfaf6;
+  --color-paper-2: #f4f1e8;
+  --color-paper-3: #ece7db;
+  --color-ink: #15140f;
+  --color-ink-2: #565147;
+  --color-ink-3: #8b8478;
+  --color-rule: #ded9cb;
+  --color-rule-soft: #eae5d9;
+  --color-rescue: #d8451f;
+  --color-rescue-deep: #a8330f;
+  --color-linked: #1c6b4a;
+
+  --font-display: "Instrument Serif", "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", STSong, SimSun, Georgia, serif;
+  --font-sans: "IBM Plex Sans", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, "PingFang SC", "Microsoft YaHei", monospace;
+
+  --leading-tightest: 0.94;
+  --tracking-micro: 0.16em;
+
+  --animate-rise: rise 0.75s cubic-bezier(0.16, 0.84, 0.34, 1) both;
+  --animate-blink: blink 1.15s steps(2, start) infinite;
+  --animate-sweep: sweep 2.6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes blink {
+  0%, 55% { opacity: 1; }
+  56%, 100% { opacity: 0; }
+}
+@keyframes sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(320%); }
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+    scroll-padding-top: 5.5rem;
+  }
+  body {
+    margin: 0;
+    background-color: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 16px;
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  /* 纸感：极淡的颗粒 + 顶部一层暖光，避免大面积纯色的廉价感 */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    opacity: 0.5;
+    background-image:
+      radial-gradient(120% 60% at 50% -10%, rgba(216, 69, 31, 0.045), transparent 60%),
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.055'/%3E%3C/svg%3E");
+  }
+  ::selection {
+    background: var(--color-rescue);
+    color: var(--color-paper);
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-rescue);
+    outline-offset: 3px;
+  }
+  h1, h2, h3 {
+    font-family: var(--font-display);
+    font-weight: 400;
+    line-height: var(--leading-tightest);
+    letter-spacing: -0.012em;
+  }
+}
+
+@utility mono-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: var(--tracking-micro);
+  text-transform: uppercase;
+  color: var(--color-ink-3);
+}
+
+/* 移动端锚点条：能横滑但不留滚动条 */
+@utility scrollbar-none {
+  scrollbar-width: none;
+  &::-webkit-scrollbar { display: none; }
+}
+
+/* 滚动进场：只用在首屏之后的区块，尊重 reduced-motion */
+.reveal {
+  opacity: 0;
+  transform: translateY(16px);
+  transition: opacity 0.7s cubic-bezier(0.16, 0.84, 0.34, 1), transform 0.7s cubic-bezier(0.16, 0.84, 0.34, 1);
+}
+.reveal.is-in {
+  opacity: 1;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .reveal { opacity: 1; transform: none; transition: none; }
+  *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
+}

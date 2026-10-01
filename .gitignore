@@ -1,5 +1,6 @@
 # 本地依赖与产物
 node_modules/
+dist/
 *.tgz
 package-lock.json
 

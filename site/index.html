@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Codex Retry Rescue · 断流自动救援</title>
+    <meta
+      name="description"
+      content="Codex++ 用户脚本：上游断流时把重试预算归零，限流时等耗尽再续跑，400 死会话自动开新对话接续。窗口最小化也有进程外看门狗盯着。"
+    />
+    <meta name="theme-color" content="#FBFAF6" />
+    <meta name="color-scheme" content="light" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Codex Retry Rescue · 断流自动救援" />
+    <meta
+      property="og:description"
+      content="第 12 次重试要等 6 分 48 秒，第 20 次要等 21 小时。这个脚本不让你等到那时。"
+    />
+    <meta property="og:url" content="https://h.yourba.top/codex-retry-rescue/" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2315140F'/%3E%3Cpath d='M16 7v9l6 4' stroke='%23E0522F' stroke-width='2.6' fill='none' stroke-linecap='round'/%3E%3Cpath d='M9 21a8.5 8.5 0 1 1 14 0' stroke='%23F5F2EA' stroke-width='2.2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E"
+    />
+    <style>
+      html { background: #fbfaf6; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>
+      <div style="max-width: 34rem; margin: 15vh auto; padding: 0 1.5rem; font: 400 16px/1.7 sans-serif; color: #15140f">
+        <p style="font-weight: 600">Codex Retry Rescue</p>
+        <p>本站点需要 JavaScript 才能渲染完整内容。项目说明与源码见 GitHub：<a href="https://github.com/vg188/codex-retry-rescue">vg188/codex-retry-rescue</a></p>
+      </div>
+    </noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
