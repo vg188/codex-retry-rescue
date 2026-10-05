@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Codex Retry Rescue
-// @version      0.13.1
+// @version      0.14.0
 // @description  Codex 断流/限流/会话死亡自动救援：重试逼近上限时打断并继续刷新预算，400 类死会话自动开新对话接续，带状态条与后台看门狗
 // ==/UserScript==
 //
@@ -152,7 +152,30 @@
   // 阈值不在持久化范围内 —— 它是逻辑正确性的一部分（见上面的注释），不该被随手改掉。
   const SETTINGS_KEY = "codexRetryRescue.settings";
   const PERSISTED = ["enabled", "maxRounds", "quietMs", "continueText", "pos", "sessionIdleMs",
-    "migratePrompt", "maxMigrations", "fatalConfirmMs", "selfHost"];
+    "migratePrompt", "maxMigrations", "fatalConfirmMs"];
+
+  // 单独按对话存储，避免旧版全局 true 自动开启所有聊天。
+  const THREAD_SETTINGS_PREFIX = "codexRetryRescue.selfHost.thread.";
+  const threadSelfHost = new Map();
+  function selfHostEnabled(id = readThreadIdCheap()) {
+    if (!id) return false;
+    try {
+      const value = localStorage.getItem(THREAD_SETTINGS_PREFIX + id) === "true";
+      threadSelfHost.set(id, value);
+      return value;
+    } catch (_) { return threadSelfHost.get(id) === true; }
+  }
+  function setSelfHost(enabled) {
+    const id = readThreadIdCheap();
+    if (!id) { note("未确认当前对话 ID，自托管保持关闭"); return false; }
+    threadSelfHost.set(id, !!enabled);
+    try { localStorage.setItem(THREAD_SETTINGS_PREFIX + id, String(!!enabled)); } catch (_) {}
+    CONFIG.selfHost = !!enabled;
+    cancelSelfHost("开关变更");
+    state.selfHostHold = false;
+    if (enabled && CONFIG.enabled && buttonState().kind === "send") armSelfHost("当前对话手动开启");
+    return true;
+  }
 
   function loadSettings() {
     try {
@@ -176,6 +199,8 @@
   loadSettings();
 
   const state = {
+    sending: false,
+    disposed: false,
     round: 0,
     threshold: pick(CONFIG.thresholds),
     busy: false,          // 正在执行一次救援，避免重入
@@ -217,7 +242,6 @@
     residualErrKeys: new Set(),
     // 本 turn 是否真的跑起来过（见过停止钮）。没跑过就不要因历史 400 去开新聊天
     sawRunningTurn: false,
-    lastThreadId: null,
     // turn 运行期间打到的 thread id 快照。迁移时优先用它 ——
     // 迁移会切到新聊天，那时再读会读到新会话/别的会话的 id。
     turnThreadId: null,
@@ -226,20 +250,16 @@
     // 400 延迟确认：先记下候选，等 fatalConfirmMs 仍存在才动手
     pendingFatalKey: null,
     pendingFatalAt: 0,
-    tidCache: null,
-    tidCacheAt: 0,
     rateLimitCache: false,
     rateLimitCacheAt: 0,
     fatalCache: null,
     fatalCacheAt: 0,
     selfHostAt: 0,
     selfHostTimer: 0,
+    selfHostGeneration: 0,
     // 人工取消后本 turn 不再排期，避免「取消→下一拍又 arm」看起来像读秒被重置
     selfHostHold: false,
     lastHumanInputAt: 0,
-    selfHostOn: false,
-    tidCheap: null,
-    tidCheapAt: 0,
     candsCache: null,
     candsCacheAt: 0,
     lenCache: 0,
@@ -715,6 +735,7 @@
       return;
     }
     state.busy = true;
+    const ctx = captureSendContext();
     state.engaged = true;
     state.status = "acting";
     try {
@@ -725,7 +746,7 @@
       // 失败已证实后的落稳（随机，短；长等待已由验收窗承担）
       const settle = Math.round(rand(CONFIG.settleMs[0], CONFIG.settleMs[1]));
       if (settle > 0) await sleep(settle);
-      if (!CONFIG.enabled) return;
+      if (!contextValid(ctx)) return;
       const st2 = buttonState();
       if (st2.kind !== "stop") { note(`落稳后按钮已变（${st2.label}），取消打断`); return; }
       // 落稳期间若出字，说明这一发其实成功了
@@ -739,7 +760,7 @@
       state.actedAtN = reading.n;
       state.lastRescueAt = now();
       endRetrySession("已接管打断");
-      st.btn.click();
+      st2.btn.click();
 
       const delay = Math.round(rand(CONFIG.resumeDelayMs[0], CONFIG.resumeDelayMs[1]));
       note(`等待 ${(delay / 1000).toFixed(1)}s`);
@@ -750,7 +771,7 @@
         note(`检测到限流，继续前多等 ${(extra / 1000).toFixed(1)}s`);
         await sleep(extra);
       }
-      if (!CONFIG.enabled) { note("已停用，取消恢复"); return; }
+      if (!contextValid(ctx)) { note("会话或输入已变，取消恢复"); return; }
 
       const after = buttonState();
       if (after.kind === "continue") {
@@ -783,19 +804,24 @@
 
   /** 启动/重置计时（加权随机 30–300s，小秒数概率更高） */
   function armSelfHost(reason) {
-    if (!CONFIG.selfHost) return;
+    if (!CONFIG.enabled || state.disposed || !selfHostEnabled()) return;
     clearSelfHostTimer();
     const delay = Math.round(randSkew(CONFIG.selfHostDelayMs[0], CONFIG.selfHostDelayMs[1], CONFIG.selfHostDelaySkew));
+    const owner = readThreadIdCheap();
+    const generation = state.selfHostGeneration;
     state.selfHostAt = now() + delay;
     state.selfHostTimer = setTimeout(() => {
+      if (generation !== state.selfHostGeneration) return;
+      state.selfHostAt = 0;
       state.selfHostTimer = 0;
-      void fireSelfHost();
+      void fireSelfHost(owner);
     }, delay);
     note(`自托管计时 ${(delay / 1000).toFixed(0)}s（${reason || ""}）`);
   }
 
   /** 打断计时 */
   function clearSelfHostTimer() {
+    state.selfHostGeneration++;
     if (state.selfHostTimer) {
       clearTimeout(state.selfHostTimer);
       state.selfHostTimer = 0;
@@ -811,42 +837,57 @@
 
   /** 仅在「本 turn 刚结束进待命」时排期一次；本 turn 内不再重复 arm */
   function armSelfHostOnceOnIdle(reason) {
-    if (!CONFIG.selfHost) return;
+    if (!CONFIG.enabled || state.disposed || !selfHostEnabled()) return;
     if (state.selfHostHold) return;
     if (state.selfHostTimer) return;
     armSelfHost(reason);
   }
 
   /** 顺延重排：到点但条件不合适，只往后挪一小段，不重抽满 30–300s */
-  function rearmSelfHostLater(ms) {
+  function rearmSelfHostLater(ms, owner = readThreadIdCheap()) {
+    if (!CONFIG.enabled || state.disposed || state.selfHostHold || !owner || owner !== readThreadIdCheap() || !selfHostEnabled(owner)) return;
     clearSelfHostTimer();
+    const generation = state.selfHostGeneration;
     state.selfHostAt = now() + ms;
-    state.selfHostTimer = setTimeout(() => { state.selfHostTimer = 0; void fireSelfHost(); }, ms);
+    state.selfHostTimer = setTimeout(() => { if (generation !== state.selfHostGeneration) return; state.selfHostAt = 0; state.selfHostTimer = 0; void fireSelfHost(owner); }, ms);
   }
 
   /** 到点：等价于点一次「继续」按钮；条件不满足就短顺延 */
-  async function fireSelfHost() {
-    if (!CONFIG.selfHost) return;
-    if (buttonState().kind !== "send") return rearmSelfHostLater(15000);
-    if (!composerEmpty()) return rearmSelfHostLater(20000);
-    if (now() - state.lastHumanInputAt < 5000) return rearmSelfHostLater(10000);
+  async function fireSelfHost(owner) {
+    if (!owner || owner !== readThreadIdCheap() || state.disposed || !CONFIG.enabled || !selfHostEnabled(owner)) return;
+    if (state.selfHostHold) return;
+    if (buttonState().kind !== "send") return rearmSelfHostLater(15000, owner);
+    if (!composerEmpty()) return rearmSelfHostLater(20000, owner);
+    if (now() - state.lastHumanInputAt < 5000) return rearmSelfHostLater(10000, owner);
     note("自托管：到点，按一次「继续」");
-    if (!await sendContinueNow()) rearmSelfHostLater(20000);
+    if (!await sendContinueNow(true)) rearmSelfHostLater(20000, owner);
   }
 
-  /** 与「继续」按钮同一条路径 */
-  async function sendContinueNow() {
-    if (state.busy) return false;
-    if (!composerEmpty()) {
-      note("输入框有内容，发送已忽略");
-      return false;
-    }
-    if (!writeComposer(CONFIG.continueText)) return false;
-    await sleep(150);
-    submitComposer();
-    await sleep(300);
-    const st = buttonState();
-    return st.kind === "stop" || st.kind === "continue" || composerEmpty();
+  // await 后必须复核对话、输入框和人工输入；禁止两个发送流程重入。
+  function captureSendContext() {
+    return { id: readThreadIdCheap(), composer: findComposer(), humanAt: state.lastHumanInputAt };
+  }
+  function contextValid(ctx) {
+    return !state.disposed && CONFIG.enabled && !!ctx.id && ctx.id === readThreadIdCheap()
+      && ctx.composer === findComposer() && ctx.humanAt === state.lastHumanInputAt;
+  }
+  async function sendContinueNow(automatic = false) {
+    if (state.busy || state.sending || !CONFIG.enabled || state.disposed) return false;
+    const ctx = captureSendContext();
+    if (!contextValid(ctx) || buttonState().kind !== "send" || !composerEmpty()) return false;
+    state.sending = true;
+    cancelSelfHost("正在续跑");
+    try {
+      if (!writeComposer(CONFIG.continueText)) return false;
+      await sleep(150);
+      if (!contextValid(ctx) || (automatic && (!selfHostEnabled(ctx.id) || state.selfHostHold))) return false;
+      if ((findComposer()?.textContent || "").trim() !== CONFIG.continueText.trim()) return false;
+      submitComposer();
+      await sleep(300);
+      if (!contextValid(ctx)) return false;
+      const st = buttonState();
+      return st.kind === "stop" || st.kind === "continue" || composerEmpty();
+    } finally { state.sending = false; }
   }
 
   function onHotkey(e) {
@@ -866,63 +907,55 @@
    * 快捷接续：开新聊天，填好「读取{id}，继续」，【不自动发送】——由你确认后再发。
    */
   async function quickNewChatResume() {
-    if (state.busy) return;
-    const threadId = state.turnThreadId || readCurrentThreadId() || "上一个对话";
-    const prompt = (CONFIG.migratePrompt || "读取{threadId}，继续")
-      .replace("{threadId}", threadId);
-    note(`快捷接续：${prompt}（填入后请手动发送）`);
+    if (state.busy || state.sending || state.disposed) return;
+    state.busy = true;
+    cancelSelfHost("快捷接续");
+    try {
+      const threadId = readCurrentThreadId();
+      if (!threadId) { note("未确认当前对话 ID，取消接续"); return; }
+      const prompt = (CONFIG.migratePrompt || "读取{threadId}，继续")
+        .replace("{threadId}", threadId);
+      note(`快捷接续：${prompt}（填入后请手动发送）`);
 
-    const draft = (findComposer()?.textContent || "").trim();
-    if (draft) {
-      note("输入框有内容，先清掉或自己发，快捷接续未执行");
-      return;
-    }
+      const draft = (findComposer()?.textContent || "").trim();
+      if (draft) {
+        note("输入框有内容，先清掉或自己发，快捷接续未执行");
+        return;
+      }
 
-    // 你手动接管这条线了，本轮耗尽证据作废 —— 否则切完新聊天，
-    // 旧会话那侧还可能被补发一次「继续」。
-    state.turnExhausted = null;
+      // 你手动接管这条线了，本轮耗尽证据作废 —— 否则切完新聊天，
+      // 旧会话那侧还可能被补发一次「继续」。
+      state.turnExhausted = null;
 
-    if (!clickNewChat()) {
-      note("没找到「新聊天」按钮");
-      return;
-    }
-    await sleep(800);
-    if (!CONFIG.enabled) return;
-    if ((findComposer()?.textContent || "").trim()) {
-      note("新聊天输入框非空，不覆盖");
-      return;
-    }
-    writeComposer(prompt);
-    // 刻意不 submit —— 等你手动发
+      if (!clickNewChat()) {
+        note("没找到「新聊天」按钮");
+        return;
+      }
+      const humanAt = state.lastHumanInputAt;
+      await sleep(800);
+      if (state.disposed || !CONFIG.enabled || readThreadIdCheap() || state.lastHumanInputAt !== humanAt) return;
+      if ((findComposer()?.textContent || "").trim()) {
+        note("新聊天输入框非空，不覆盖");
+        return;
+      }
+      writeComposer(prompt);
+      // 刻意不 submit —— 等你手动发
+    } finally { state.busy = false; }
   }
 
   async function resumeByPrompt() {
-    const composer = findComposer();
-    if (composer && (composer.textContent || "").trim()) {
-      note("输入框里有你正在写的内容，不覆盖，跳过");
-      return false;
-    }
-    if (!writeComposer(CONFIG.continueText)) { note("写入输入框失败"); return false; }
-    await sleep(200);
-    submitComposer();
-    note(`已发送续跑指令`);
-    cancelSelfHost("已手动/自动续跑");
-
-    // 自检：发送后若仍是「发送」态，说明没接上，再补一次
-    for (let i = 0; i < 2; i++) {
-      await sleep(2000);
-      const st = buttonState();
-      if (st.kind === "stop") { note("续跑已启动"); return true; }
-      if (st.kind === "send" && (findComposer()?.textContent || "").trim() === "") {
-        note(`续跑未生效（${st.label}），补发一次`);
-        if (!writeComposer(CONFIG.continueText)) break;
-        await sleep(200);
-        submitComposer();
-      } else {
-        break;
-      }
-    }
-    return true;
+    const ctx = captureSendContext();
+    if (!contextValid(ctx) || !composerEmpty() || state.sending) return false;
+    state.sending = true;
+    try {
+      if (!writeComposer(CONFIG.continueText)) return false;
+      await sleep(200);
+      if (!contextValid(ctx) || (findComposer()?.textContent || "").trim() !== CONFIG.continueText.trim()) return false;
+      submitComposer();
+      note("已发送续跑指令（不因快速结束而重复补发）");
+      cancelSelfHost("已续跑");
+      return true;
+    } finally { state.sending = false; }
   }
 
   async function handleExhausted(reading, reason) {
@@ -1029,171 +1062,52 @@
   /** 从任意字符串里抠 UUID（参考 codex-context-used-meter 的 normalizeConversationUuid） */
   function normalizeConversationUuid(value) {
     if (value == null) return null;
-    const m = String(value).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-    return m ? m[0].toLowerCase() : null;
+    const m = String(value).match(/^(?:local:)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+    return m ? m[1].toLowerCase() : null;
   }
 
-  /**
-   * 当前 thread id。用户续跑习惯是「读取{id}，继续」，id 与
-   * 「复制深度链接」codex://threads/{id} 以及 /state 里「会话/对话串」一致。
-   *
-   * 实测优先级（0.7.2 修正，之前用 codexThreadScroll 的 at 最大值会命中别的会话）：
-   *   1) /state 面板「会话/对话串：UUID」—— 与深度链接一致的真值
-   *   2) 侧栏选中行 data-app-action-sidebar-thread-id=local:01a0…
-   *      （local:client-new-thread:UUID 不是 thread id）
-   *   3) React fiber 挖 threadId / conversationId
-   *   4) 主对话区里的 01a0…（若 /state 开着，第一条就是真 id）
-   */
-  /**
-   * 极轻量：只读侧栏选中行的 thread id（主循环每拍用这个检测会话切换）。
-   * 绝不要在这里跑 React 扫描 —— 每 700ms 扫 fiber 会把渲染线程打死。
-   */
+  // 只沿正文 DOM 的 fiber.return 走最多 32 层，不递归扫描 children/state。
+  // 新聊天开始后侧栏可能仍用 client-new-thread；必须核对祖先上的映射。
+  function readThreadIdentityFromContent() {
+    const el = document.querySelector('[data-thread-find-target="conversation"]');
+    if (!el) return null;
+    const key = Object.keys(el).find(k => k.startsWith("__reactFiber$"));
+    let fiber = key && el[key];
+    let id = null;
+    let clientId = null;
+    for (let depth = 0; fiber && depth < 32; depth++, fiber = fiber.return) {
+      const props = fiber.memoizedProps;
+      if (!props) continue;
+      id ||= normalizeConversationUuid(props.conversationId) || normalizeConversationUuid(props.threadId);
+      if (typeof props.clientThreadId === "string") clientId ||= props.clientThreadId;
+      if (id && clientId) break;
+    }
+    return id ? { id, clientId } : null;
+  }
+
+  /** 从当前选中项或明确的 thread 路由读取 ID，不限制时间前缀。 */
   function readThreadIdCheap() {
-    const t = now();
-    if (state.tidCheapAt && t - state.tidCheapAt < 2000) return state.tidCheap;
-    state.tidCheapAt = t;
+    // 轻量 DOM 读取不缓存：计时回调必须看到此刻的选中项，不能沿用旧会话。
     try {
-      const sel =
-        document.querySelector('[aria-current="page"][data-app-action-sidebar-thread-id]')
+      const sel = document.querySelector('[aria-current="page"][data-app-action-sidebar-thread-id]')
         || document.querySelector('[data-app-action-sidebar-thread-active="true"][data-app-action-sidebar-thread-id]')
         || document.querySelector('[data-app-action-sidebar-thread-selected="true"]');
-      const raw = sel?.getAttribute("data-app-action-sidebar-thread-id") || "";
-      const uuid = normalizeConversationUuid(raw);
-      state.tidCheap = uuid && /^01a0/i.test(uuid) ? uuid : state.tidCheap;
-    } catch (_) { /* ignore */ }
-    return state.tidCheap;
+      const raw = sel ? (sel.getAttribute("data-app-action-sidebar-thread-id") || sel.getAttribute("data-thread-id") || "")
+        : (window.location?.pathname || "").match(/\/threads\/([^/]+)/)?.[1];
+      const content = readThreadIdentityFromContent();
+      if (/client-new-thread/i.test(raw || "")) {
+        return content && content.clientId === raw.replace(/^local:/, "") ? content.id : null;
+      }
+      const selectedId = normalizeConversationUuid(raw);
+      // 侧栏先切、正文后切时宁可暂缓，不能把旧正文的操作送到新对话。
+      if (selectedId && content && selectedId !== content.id) return null;
+      return selectedId || (!sel && content ? content.id : null);
+    } catch (_) { return null; }
   }
 
   function readCurrentThreadId() {
-    // 主循环每拍都会问一次（用于检测会话切换）；React 扫描很贵，做 1.5s 缓存
-    const t = now();
-    if (state.tidCache && t - state.tidCacheAt < 1500) return state.tidCache;
-
-    const result = readCurrentThreadIdUncached();
-    state.tidCache = result;
-    state.tidCacheAt = t;
-    return result;
-  }
-
-  function readCurrentThreadIdUncached() {
-    // ---- 1) /state 面板 ----
-    const fromState = readThreadIdFromStatePanel();
-    if (fromState) {
-      state.lastThreadId = fromState;
-      return fromState;
-    }
-
-    // ---- 2) 侧栏 selected / active 的 local:01a0… ----
-    const sel =
-      document.querySelector('[aria-current="page"][data-app-action-sidebar-thread-id]')
-      || document.querySelector('[data-app-action-sidebar-thread-active="true"][data-app-action-sidebar-thread-id]')
-      || document.querySelector('[data-app-action-sidebar-thread-selected="true"]');
-    if (sel) {
-      const raw =
-        sel.getAttribute("data-app-action-sidebar-thread-id")
-        || sel.getAttribute("data-thread-id")
-        || sel.getAttribute("data-conversation-id")
-        || "";
-      // 只接受 01a0… 形态；client-new-thread 的随机 UUID 不是 thread id
-      const uuid = normalizeConversationUuid(raw);
-      if (uuid && /^01a0/i.test(uuid)) {
-        state.lastThreadId = uuid;
-        return uuid;
-      }
-    }
-
-    // ---- 3) React fiber ----
-    const reactId = readThreadIdFromReact();
-    if (reactId) {
-      state.lastThreadId = reactId;
-      return reactId;
-    }
-
-    // ---- 4) 主对话区 01a0… 文本 ----
-    const main = document.querySelector("main")
-      || document.querySelector("[data-thread-find-target]")
-      || threadRoot();
-    const viaText = (main?.innerText || "").match(/\b(01a0[0-9a-f-]{30,})\b/i);
-    if (viaText) {
-      state.lastThreadId = viaText[1].toLowerCase();
-      return state.lastThreadId;
-    }
-
-    return state.lastThreadId;
-  }
-
-  /**
-   * 从 /state 状态块读 thread id。
-   * 实测 DOM：label 节点文本「会话/对话串：」，父级 contents 里拼着
-   * 「会话/对话串：01a0xxxx-…」，与「复制深度链接」完全一致。
-   * 面板没开时返回 null。
-   */
-  function readThreadIdFromStatePanel() {
-    const body = threadRoot()?.innerText || document.body.innerText || "";
-    const m = body.match(/会话\/对话串[^0-9a-f]{0,24}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-    if (m && /^01a0/i.test(m[1])) return m[1].toLowerCase();
-
-    // 英文界面兜底
-    const m2 = body.match(/(?:Session|Conversation|Thread)\s*(?:ID|id)[:\s]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-    if (m2 && /^01a0/i.test(m2[1])) return m2[1].toLowerCase();
-    return null;
-  }
-
-  /**
-   * 轻量 React fiber 扫描：只在稳定锚点上找 conversationId/threadId。
-   * 完整版见 codex-context-used-meter（3800 行）；这里只抄迁移需要的最小集合。
-   */
-  function readThreadIdFromReact() {
-    const anchors = [
-      document.querySelector('[data-thread-find-target="conversation"]'),
-      document.querySelector("[data-codex-composer]"),
-      document.querySelector("main"),
-      document.getElementById("root"),
-    ].filter(Boolean);
-
-    const KEYS = ["threadId", "conversationId", "localConversationId", "id", "key"];
-    const seen = new WeakSet();
-
-    const walk = (value, depth) => {
-      if (!value || typeof value !== "object" || depth < 0 || seen.has(value)) return null;
-      seen.add(value);
-
-      for (const key of KEYS) {
-        let candidate;
-        try { candidate = value[key]; } catch { continue; }
-        const uuid = normalizeConversationUuid(candidate);
-        if (uuid && /^01a0/i.test(uuid)) return uuid;
-      }
-
-      if (Array.isArray(value)) {
-        for (let i = 0; i < Math.min(value.length, 20); i++) {
-          const hit = walk(value[i], depth - 1);
-          if (hit) return hit;
-        }
-        return null;
-      }
-
-      // React 私有属性 __reactProps$ / __reactFiber$ / __reactContainer$
-      for (const k of Object.keys(value)) {
-        if (!/^__react(?:Props|Fiber|Container)\$/.test(k)) continue;
-        let child;
-        try { child = value[k]; } catch { continue; }
-        const hit = walk(child, depth - 1);
-        if (hit) return hit;
-      }
-      return null;
-    };
-
-    for (const anchor of anchors) {
-      for (const k of Object.keys(anchor)) {
-        if (!/^__react(?:Props|Fiber|Container)\$/.test(k)) continue;
-        let child;
-        try { child = anchor[k]; } catch { continue; }
-        const hit = walk(child, 10);
-        if (hit) return hit;
-      }
-    }
-    return null;
+    // 不从正文或历史 /state 文本猜 ID，避免把被引用的其他聊天当成当前聊天。
+    return readThreadIdCheap();
   }
 
   /** 左上角「新聊天」。不要点「在 xxx 中开始新聊天」，文本必须等于「新聊天」 */
@@ -1252,7 +1166,7 @@
   }
 
   async function handleFatalError(err) {
-    if (state.busy) return;
+    if (state.busy || state.sending || state.disposed || !readThreadIdCheap()) return;
     if (state.actedErrKeys.has(err.key) || state.residualErrKeys.has(err.key)) return;
     // 没见过本 turn 真正跑起来（停止钮）就不要自动开新聊天 ——
     // 典型误伤：只是打开了一条历史上带 400 的旧会话。
@@ -1311,8 +1225,10 @@
       }
 
       // 等新会话壳起来、输入框清空
+      const humanAt = state.lastHumanInputAt;
       await sleep(800);
-      if (!CONFIG.enabled) { note("已停用，取消迁移"); return; }
+      if (state.disposed || !CONFIG.enabled || readThreadIdCheap() || state.lastHumanInputAt !== humanAt) { note("会话或输入已变，取消迁移"); return; }
+      const newComposer = findComposer();
 
       if ((findComposer()?.textContent || "").trim()) {
         note("新对话输入框非空，不覆盖，迁移中止");
@@ -1326,6 +1242,8 @@
         return;
       }
       await sleep(250);
+      if (state.disposed || !CONFIG.enabled || readThreadIdCheap() || findComposer() !== newComposer || state.lastHumanInputAt !== humanAt) return;
+      if ((newComposer?.textContent || "").trim() !== prompt.trim()) return;
       submitComposer();
 
       state.engaged = false;          // 新会话按普通轮次走，不绑旧接管
@@ -1341,7 +1259,42 @@
   }
 
   // ------------------------------------------------------------------ 主循环
+  function syncThreadContext() {
+    // 会话切换：你手动点开别的对话（含历史报错对话）时，整段 turn 状态必须清零。
+    // 用轻量侧栏 id，禁止每拍 React 扫描。
+    const nowTid = readThreadIdCheap();
+    CONFIG.selfHost = selfHostEnabled(nowTid);
+    if (nowTid !== state.currentThreadId) {
+      note(`切换会话 ${state.currentThreadId?.slice(0, 8) || "无"} → ${nowTid?.slice(0, 8) || "无"}`);
+      state.selfHostHold = false;
+      state.prevBtnKind = null;
+      state.sawRunningTurn = false;
+      state.turnThreadId = null;
+      state.engaged = false;
+      endRetrySession("切换会话");
+      clearConfirmWindow();
+      cancelSelfHost("切换会话");
+      state.turnExhausted = null;
+      // 新会话里已有的报错框全是历史，基准必须按新 DOM 重扫一遍再定，
+      // 否则「一进来就数到 3 个框」会被当成刚撞上限流。
+      state.candsCacheAt = 0;
+      state.candsCache = null;
+      state.fatalCacheAt = 0;
+      state.fatalCache = null;
+      state.rateLimitCacheAt = 0;
+      state.lenCacheAt = 0;
+      markAllRetriesStale();
+      state.len = threadLen();
+      state.rateLimitHit = null;
+      state.rateLimitBase = state.rlLeaves;
+      markCurrentFatalsResidual();   // 新会话里已有的 400 全是残留
+    }
+    state.currentThreadId = nowTid;
+
+  }
+
   function tick() {
+    syncThreadContext();
     // 一拍只扫一次 DOM：retryCandidates 最贵，不能让 threadLen 和 readRetry 各扫一遍
     const cands = retryCandidates();
     const reading = readRetryFrom(cands);
@@ -1352,8 +1305,9 @@
 
     const st = buttonState();
 
-    if (!CONFIG.enabled) { state.status = "paused"; return; }
-    if (state.busy) return;
+    CONFIG.selfHost = selfHostEnabled();
+    if (!CONFIG.enabled) { cancelSelfHost("已暂停"); state.status = "paused"; return; }
+    if (state.busy || state.sending) return;
 
     // 限流报错框的「本轮新撞」判定要在任何分支之前先跟一遍
     trackRateLimitBoxes();
@@ -1370,27 +1324,7 @@
       state.rateLimitBase = state.rlLeaves;   // 本轮开始就存在的框，全部算历史
       markCurrentFatalsResidual();
     }
-    // 会话切换：你手动点开别的对话（含历史报错对话）时，整段 turn 状态必须清零。
-    // 用轻量侧栏 id，禁止每拍 React 扫描。
-    const nowTid = readThreadIdCheap();
-    if (nowTid && state.currentThreadId && nowTid !== state.currentThreadId) {
-      note(`切换会话 ${state.currentThreadId.slice(0, 8)} → ${nowTid.slice(0, 8)}`);
-      state.sawRunningTurn = false;
-      state.turnThreadId = null;
-      state.engaged = false;
-      endRetrySession("切换会话");
-      clearConfirmWindow();
-      cancelSelfHost("切换会话");
-      state.turnExhausted = null;
-      // 新会话里已有的报错框全是历史，基准必须按新 DOM 重扫一遍再定，
-      // 否则「一进来就数到 3 个框」会被当成刚撞上限流。
-      state.lenCacheAt = 0;
-      state.len = threadLen();
-      state.rateLimitHit = null;
-      state.rateLimitBase = state.rlLeaves;
-      markCurrentFatalsResidual();   // 新会话里已有的 400 全是残留
-    }
-    if (nowTid) state.currentThreadId = nowTid;
+    const nowTid = state.currentThreadId;
 
     if (st.kind === "stop") {
       state.sawRunningTurn = true;
@@ -1876,14 +1810,8 @@
     acts.append(
       mkAction(CONT_BTN_ID, "继续", "发送「继续」（Ctrl+Alt+C 亦可）", () => sendContinueNow()),
       mkAction(QUICK_BTN_ID, "接续", "新聊天并填入：读取{当前id}，继续（不自动发送）", () => quickNewChatResume()),
-      mkAction(SELF_HOST_ID, "自托管 关", "点击开关自托管（轮次结束后随机 30–300s 自动发「继续」）", () => {
-        CONFIG.selfHost = !CONFIG.selfHost;
-        saveSettings();
-        if (CONFIG.selfHost) {
-          state.selfHostHold = false;
-          armSelfHost("手动开启");
-          note("自托管已开启");
-        } else cancelSelfHost("已关闭");
+      mkAction(SELF_HOST_ID, "自托管 关", "仅开关当前对话的自托管（轮次结束后随机 30–300s 自动发「继续」）", () => {
+        setSelfHost(!selfHostEnabled());
         paintBar();
       }, "sh-dot"),
     );
@@ -1913,7 +1841,7 @@
     if (!state.retrySession && state.engaged) bits.push("等活跃重试");
     const subText = bits.join(" · ");
 
-    const on = !!CONFIG.selfHost;
+    const on = selfHostEnabled();
     const left = state.selfHostAt ? Math.max(0, Math.round((state.selfHostAt - now()) / 1000)) : 0;
     const shText = on ? (state.selfHostTimer ? `${left}s` : "待命") : "关";
     const shColor = on ? (state.selfHostTimer ? C.good : C.wait) : C.neutral;
@@ -2080,7 +2008,7 @@
     const r = readRetry();
     const isFlowing = flowing(state, CONFIG);
 
-    const on = !!CONFIG.selfHost;
+    const on = selfHostEnabled();
     const left = state.selfHostAt ? Math.max(0, Math.round((state.selfHostAt - now()) / 1000)) : 0;
     const vals = {
       "i-status": (STATUS_META[state.status] || STATUS_META.idle).label,
@@ -2141,6 +2069,7 @@
   markCurrentFatalsResidual();
   state.rateLimitBase = state.rlLeaves;   // 启动时就存在的限流框全是历史
   state.currentThreadId = readCurrentThreadId();
+  CONFIG.selfHost = selfHostEnabled();
 
   const pulse = () => {
     try {
@@ -2194,6 +2123,7 @@
   // 只把「在输入框打字」当人工：滑动对话、点空白都不该碰自托管。
   // 取消后置 hold，避免下一拍 send 分支又 arm，看起来像读秒被重置。
   state.onComposerHuman = ev => {
+    if (!ev.isTrusted) return;
     const t = ev.target;
     if (!t || !findComposer()) return;
     const composer = findComposer();
@@ -2266,6 +2196,7 @@
   }
 
   function destroy() {
+    state.disposed = true;
     CONFIG.enabled = false;
     stopClocks();
     clearSelfHostTimer();
@@ -2317,5 +2248,6 @@
     rateLimitVisible,
     quickNewChatResume,
     sendContinueNow,
+    setSelfHost,
   };
 })();
