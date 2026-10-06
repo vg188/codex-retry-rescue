@@ -171,3 +171,14 @@ node --test tests/retry-rescue.test.mjs
 ```
 
 测试覆盖按对话持久化、旧配置升级、临时 ID 映射、旧计时器失效、切换会话/人工输入/暂停/销毁时取消发送，以及防重复发送。测试用受控 DOM 和时钟运行生产函数，不会向真实聊天发送消息。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
+
+
+### 浏览器发送冒烟测试
+
+`tests/browser-smoke.html` 使用真实 contenteditable、`execCommand` 和点击事件，只更新本地计数器，不连接 Codex、不发送真实消息。以仓库目录启动静态服务：
+
+```sh
+python -m http.server 18764 --bind 127.0.0.1
+```
+
+打开 `http://127.0.0.1:18764/tests/browser-smoke.html`，在开发者工具执行 `await runSmokeTest()`。预期 `sent: true`、`submissions: 1`、`humanTimestampUnchanged: true`、`draft: ""`；重新测试前刷新页面。此测试用于捕捉 Node 模拟 DOM 无法独立验证的 Chromium 事件行为。

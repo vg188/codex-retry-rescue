@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Codex Retry Rescue
-// @version      0.14.0
+// @version      0.14.1
 // @description  Codex 断流/限流/会话死亡自动救援：重试逼近上限时打断并继续刷新预算，400 类死会话自动开新对话接续，带状态条与后台看门狗
 // ==/UserScript==
 //
@@ -200,6 +200,7 @@
 
   const state = {
     sending: false,
+    composerWriteDepth: 0, // execCommand 的 input 也可能 isTrusted=true，仅同步写入时屏蔽
     disposed: false,
     round: 0,
     threshold: pick(CONFIG.thresholds),
@@ -521,30 +522,49 @@
   function writeComposer(text) {
     const input = findComposer();
     if (!input) return false;
-    input.focus();
+    state.composerWriteDepth++;
     try {
-      const sel = window.getSelection?.();
-      const range = document.createRange();
-      range.selectNodeContents(input);
-      sel?.removeAllRanges?.();
-      sel?.addRange?.(range);
-    } catch (_) { /* ignore */ }
-
-    let ok = false;
-    try { ok = document.execCommand("insertText", false, text); } catch (_) { ok = false; }
-    if (!ok) {
+      input.focus();
       try {
-        input.dispatchEvent(new InputEvent("beforeinput", {
-          bubbles: true, cancelable: true, inputType: "insertText", data: text,
-        }));
-        input.textContent = text;
-        input.dispatchEvent(new InputEvent("input", {
-          bubbles: true, cancelable: true, inputType: "insertText", data: text,
-        }));
-        ok = true;
-      } catch (_) { ok = false; }
+        const sel = window.getSelection?.();
+        const range = document.createRange();
+        range.selectNodeContents(input);
+        sel?.removeAllRanges?.();
+        sel?.addRange?.(range);
+      } catch (_) { /* ignore */ }
+
+      let ok = false;
+      try { ok = document.execCommand("insertText", false, text); } catch (_) { ok = false; }
+      if (!ok) {
+        try {
+          input.dispatchEvent(new InputEvent("beforeinput", {
+            bubbles: true, cancelable: true, inputType: "insertText", data: text,
+          }));
+          input.textContent = text;
+          input.dispatchEvent(new InputEvent("input", {
+            bubbles: true, cancelable: true, inputType: "insertText", data: text,
+          }));
+          ok = true;
+        } catch (_) { ok = false; }
+      }
+      return ok;
+    } finally { state.composerWriteDepth--; }
+  }
+
+  function onComposerHuman(ev) {
+    // 浏览器生成的 execCommand input 属于 trusted 事件，不能单靠 isTrusted 区分。
+    // 不用 sending/busy 屏蔽整个异步流程：await 期间的真人输入仍必须取消发送。
+    if (!ev.isTrusted || state.composerWriteDepth > 0) return;
+    const t = ev.target;
+    if (!t || !findComposer()) return;
+    const composer = findComposer();
+    if (t === composer || composer.contains?.(t) || t.closest?.("[data-codex-composer], .ProseMirror")) {
+      state.lastHumanInputAt = now();
+      if (state.selfHostTimer) {
+        state.selfHostHold = true;
+        cancelSelfHost("输入框人工，等下一轮");
+      }
     }
-    return ok;
   }
 
   function submitComposer() {
@@ -2122,19 +2142,7 @@
 
   // 只把「在输入框打字」当人工：滑动对话、点空白都不该碰自托管。
   // 取消后置 hold，避免下一拍 send 分支又 arm，看起来像读秒被重置。
-  state.onComposerHuman = ev => {
-    if (!ev.isTrusted) return;
-    const t = ev.target;
-    if (!t || !findComposer()) return;
-    const composer = findComposer();
-    if (t === composer || composer.contains?.(t) || t.closest?.("[data-codex-composer], .ProseMirror")) {
-      state.lastHumanInputAt = now();
-      if (state.selfHostTimer) {
-        state.selfHostHold = true;
-        cancelSelfHost("输入框人工，等下一轮");
-      }
-    }
-  };
+  state.onComposerHuman = onComposerHuman;
   state.onHotkey = onHotkey;
   window.addEventListener?.("keydown", state.onHotkey, true);
   document.addEventListener?.("input", state.onComposerHuman, true);

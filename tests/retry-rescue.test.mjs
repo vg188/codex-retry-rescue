@@ -6,11 +6,25 @@ import vm from 'node:vm';
 const A = '01a10b14-5c28-71f1-be34-b511f6300973';
 const B = '01a10b14-5c28-71f1-be34-b511f6300974';
 const source = readFileSync(new URL('../user_scripts/codex-retry-rescue.js', import.meta.url), 'utf8');
-function harness(storage = new Map()) {
+function harness(storage = new Map(), { nativeWrite = false } = {}) {
   const env = { id: A, composer: { textContent: '' }, kind: 'send', submissions: 0, sleeps: [], timers: new Map(), seq: 0 };
+  env.nativeWrite = nativeWrite;
+  env.composer.focus = () => {};
+  env.composer.dispatchEvent = event => { env.onInput({...event, target:env.composer}); return true; };
   const context = vm.createContext({
     window: { location: { pathname: '/' } },
-    document: { querySelector: selector => selector === '[data-thread-find-target="conversation"]' ? env.content || null : env.id ? { getAttribute: () => `local:${env.id}` } : null },
+    document: {
+      querySelector: selector => selector === '[data-thread-find-target="conversation"]' ? env.content || null : env.id ? { getAttribute: () => `local:${env.id}` } : null,
+      createRange: () => ({selectNodeContents() {}}),
+      execCommand(command, unused, text) {
+        if (env.execCommandResult === false) return false;
+        env.composer.textContent = text;
+        // Chromium's execCommand creates a trusted input event, despite its JS caller.
+        env.onInput({type:'input', isTrusted:true, target:env.composer});
+        return true;
+      },
+    },
+    InputEvent: class { constructor(type, options) { Object.assign(this, options, {type, isTrusted:false}); } },
     localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
     console: { log() {} },
     setTimeout(fn, ms) { if (ms < 1000) { env.sleeps.push(fn); return ++env.seq; } const id = ++env.seq; env.timers.set(id, fn); return id; },
@@ -22,15 +36,16 @@ function harness(storage = new Map()) {
   vm.runInContext(definitions + `
     findComposer = () => env.composer;
     buttonState = () => ({kind: env.kind});
-    writeComposer = text => { env.composer.textContent = text; return true; };
+    if (!env.nativeWrite) writeComposer = text => { env.composer.textContent = text; return true; };
     submitComposer = () => { env.submissions++; env.composer.textContent = ''; };
     clickNewChat = () => { env.id = null; env.composer = {textContent: ""}; return true; };
     markAllRetriesStale = () => {};
     markCurrentFatalsResidual = () => {};
     threadLen = () => 0;
     window.testApi = {CONFIG, state, selfHostEnabled, setSelfHost, readThreadIdCheap, readCurrentThreadId,
-      fireSelfHost, sendContinueNow, resumeByPrompt, syncThreadContext, saveSettings, quickNewChatResume};
+      fireSelfHost, sendContinueNow, resumeByPrompt, syncThreadContext, saveSettings, quickNewChatResume, writeComposer, onComposerHuman};
   })();`, context);
+  env.onInput = context.window.testApi.onComposerHuman;
   return { env, api: context.window.testApi, context, storage,
     async advance() { assert.ok(env.sleeps.length, 'pending sleep'); env.sleeps.shift()(); await Promise.resolve(); await Promise.resolve(); } };
 }
@@ -213,4 +228,58 @@ test('exhausted continuation aborts after switching conversations', async () => 
   await h.advance();
   assert.equal(await p, false);
   assert.equal(h.env.submissions, 0);
+});
+
+
+test('trusted execCommand input does not cancel automatic continuation', async () => {
+  const h = harness(new Map(), {nativeWrite:true});
+  h.api.setSelfHost(true);
+  const humanAt = h.api.state.lastHumanInputAt;
+  const p = h.api.sendContinueNow(true);
+  assert.equal(h.env.composer.textContent, h.api.CONFIG.continueText);
+  assert.equal(h.api.state.lastHumanInputAt, humanAt);
+  assert.equal(h.api.state.composerWriteDepth, 0);
+  await h.advance();
+  await h.advance();
+  assert.equal(await p, true);
+  assert.equal(h.env.submissions, 1);
+});
+
+test('real trusted human input during the await still cancels submission', async () => {
+  const h = harness(new Map(), {nativeWrite:true});
+  h.api.setSelfHost(true);
+  const p = h.api.sendContinueNow(true);
+  assert.equal(h.api.state.sending, true);
+  h.env.composer.textContent += ' human edit';
+  h.api.onComposerHuman({type:'input', isTrusted:true, target:h.env.composer});
+  assert.ok(h.api.state.lastHumanInputAt > 0);
+  await h.advance();
+  assert.equal(await p, false);
+  assert.equal(h.env.submissions, 0);
+  assert.ok(h.env.composer.textContent.endsWith(' human edit'));
+});
+
+test('trusted programmatic write does not cancel timer but real human input does', () => {
+  const h = harness(new Map(), {nativeWrite:true});
+  h.api.setSelfHost(true);
+  const timer = h.api.state.selfHostTimer;
+  assert.equal(h.api.writeComposer('continue'), true);
+  assert.equal(h.api.state.selfHostTimer, timer);
+  assert.equal(h.api.state.selfHostHold, false);
+  h.api.onComposerHuman({type:'input', isTrusted:true, target:h.env.composer});
+  assert.equal(h.api.state.selfHostTimer, 0);
+  assert.equal(h.api.state.selfHostHold, true);
+});
+
+test('write guard is released after exceptions and fallback input', () => {
+  const h = harness(new Map(), {nativeWrite:true});
+  h.env.composer.focus = () => { throw new Error('focus failure'); };
+  assert.throws(() => h.api.writeComposer('continue'), /focus failure/);
+  assert.equal(h.api.state.composerWriteDepth, 0);
+  h.env.composer.focus = () => {};
+  h.env.execCommandResult = false;
+  assert.equal(h.api.writeComposer('fallback'), true);
+  assert.equal(h.env.composer.textContent, 'fallback');
+  assert.equal(h.api.state.composerWriteDepth, 0);
+  assert.equal(h.api.state.lastHumanInputAt, 0);
 });

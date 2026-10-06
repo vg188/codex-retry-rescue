@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Retry Rescue isolated browser smoke test</title>
+<style>[contenteditable] { width:400px; min-height:40px; border:1px solid; } button { padding:10px; }</style>
+<div aria-current="page" data-app-action-sidebar-thread-id="local:01a10000-0000-7000-8000-000000000001"></div>
+<div><div contenteditable="true" data-codex-composer></div><button aria-label="Send" id="send">Send (local counter only)</button></div>
+<pre id="result">Run: await runSmokeTest()</pre>
+<script>
+// Isolated fixture: no Codex app, network calls, or real message submission.
+window.fetch = async () => { throw new Error('Network disabled in fixture'); };
+let submissions = 0;
+const editor = document.querySelector('[contenteditable]');
+const inputs = [];
+editor.addEventListener('input', e => inputs.push({trusted:e.isTrusted, inputType:e.inputType}));
+document.querySelector('#send').onclick = () => { submissions++; editor.textContent = ''; };
+window.runSmokeTest = async () => {
+  const api = window.__codexRetryRescue;
+  api.setSelfHost(true);
+  const before = api.state.lastHumanInputAt;
+  const sent = await api.sendContinueNow(true);
+  api.setSelfHost(false);
+  const result = { sent, submissions, inputs, humanTimestampUnchanged: before === api.state.lastHumanInputAt, draft: editor.textContent };
+  document.querySelector('#result').textContent = JSON.stringify(result, null, 2);
+  return result;
+};
+</script>
+<script src="../user_scripts/codex-retry-rescue.js?v=0.14.1"></script>
