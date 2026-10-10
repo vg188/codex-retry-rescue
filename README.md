@@ -10,7 +10,8 @@
 
 | 界面上看到的 | 性质 | 脚本做什么 |
 |---|---|---|
-| `正在重新连接 8/10`、high demand、上游地址失败 | 流断了，请求本身没问题 | **预防性打断**：确认这一发已经失败后点「停止」，等几秒点「继续」，把重试预算归零 |
+| `正在重新连接 8/10`、上游地址失败 | 流断了，请求本身没问题 | **预防性打断**：确认这一发已经失败后点「停止」，等几秒点「继续」，把重试预算归零 |
+| `We’re currently experiencing high demand, which may cause temporary errors.` | 通道池满载，同上，还能重连 | 同上走**预防性打断**（7~9 随机临界）；这一轮没经过重连行就被打回、且已停下 → **立刻**发「继续」（`highDemandImmediate`） |
 | `rate limit exceeded … token rate limit`、429 | 限流 | **不打断**（打断等于继续加请求）；这一轮停下后**立刻**发「继续」，不排自托管读秒 |
 | `bad response status code 400/413/422` 错误框 | 请求被拒，原地继续必然再失败 | **死会话迁移**：开新聊天 + 发 `读取{threadId}，继续` |
 | 重试打满、本轮没产出 | 预算耗尽 | 同一个会话里发一句「继续」 |
@@ -43,6 +44,7 @@
 |---|---|---|
 | `retryText` | 重试行：`正在重新连接 8/10` | `正在重新连接\|重新连接\|Reconnecting\|Reconnect` |
 | `rateLimitText` | 限流文案，命中就不做预防性打断 | `rate\\s*limit\|token\\s*rate\\s*limit\|\\b429\\b\|限流\|超出.{0,6}限` |
+| `highDemandText` | 通道池满载那句暂时性报错（见上面故障表）。**别并进 `rateLimitText`**：限流禁止打断，这条正因为要打断才单独分一类 | `high\\s+demand` |
 | `fatalText` | 「会话已死」的错误框文案，**第 1 个捕获组必须是 3 位状态码** | `bad response status code\\s*(\\d{3})` |
 | `fatalRequestId` | 从同一句文案里取请求标识用于去重；没有就填 `""` | `request id:\\s*([^)\\s]+)` |
 | `fatalContainers` | 错误框的 DOM 特征（逗号分隔 CSS 选择器），命中才算错误框 | `aside,.wrap-anywhere` |
@@ -78,7 +80,7 @@
 - 你在输入框打字、切换会话、开启新一轮 → **取消本轮读秒**，等下一轮结束再排
 - 滑动屏幕、点空白处**不会**打断读秒
 - **本轮真的跑过才排**：点开一条从没发过言的会话（比如刚「创建新项目」）不会平白排读秒
-- 撞到限流并停下**不走**这条：那种情况立刻续跑（`rateLimitImmediate`）
+- 撞到限流或 high demand 并停下**不走**这条：那种情况立刻续跑（`rateLimitImmediate` / `highDemandImmediate`）
 
 ## 配置项（脚本里的 `CONFIG`）
 
@@ -88,6 +90,7 @@
 | `enablePreventiveRescue` | `true` | 是否允许预防性打断（关掉就只等耗尽后续跑） |
 | `skipPreventiveOnRateLimit` | `true` | 限流时跳过预防性打断，等它停下 |
 | `rateLimitImmediate` | `true` | 本轮撞限流停下后立刻发「继续」，不等自托管读秒 |
+| `highDemandImmediate` | `true` | 本轮撞到 high demand 且已停下，同上立刻发「继续」 |
 | `thresholds` | `[7, 8, 9]` | 每轮随机抽一个临界次数（避免固定节奏被识别） |
 | `confirmWindowMs` | `[3000, 4000]` | 跳号后给「这一发」证明自己能出字的窗口 |
 | `settleMs` | `[200, 600]` | 确认失败后的落稳时间 |

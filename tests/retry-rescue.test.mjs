@@ -15,6 +15,7 @@ function harness(storage = new Map(), { nativeWrite = false } = {}) {
     window: { location: { pathname: '/' } },
     document: {
       querySelector: selector => selector === '[data-thread-find-target="conversation"]' ? env.content || null : env.id ? { getAttribute: () => `local:${env.id}` } : null,
+      getElementById: () => env.host || null,
       createRange: () => ({selectNodeContents() {}}),
       execCommand(command, unused, text) {
         if (env.execCommandResult === false) return false;
@@ -42,8 +43,11 @@ function harness(storage = new Map(), { nativeWrite = false } = {}) {
     markAllRetriesStale = () => {};
     markCurrentFatalsResidual = () => {};
     threadLen = () => 0;
+    const realThreadRoot = threadRoot;
+    threadRoot = () => env.root || realThreadRoot();
     window.testApi = {CONFIG, state, selfHostEnabled, setSelfHost, readThreadIdCheap, readCurrentThreadId,
-      fireSelfHost, sendContinueNow, resumeByPrompt, syncThreadContext, saveSettings, quickNewChatResume, writeComposer, onComposerHuman};
+      fireSelfHost, sendContinueNow, resumeByPrompt, syncThreadContext, saveSettings, quickNewChatResume, writeComposer, onComposerHuman,
+      threadLenFrom, errorTextLeaves, isErrorTextLeaf, trackHighDemandBoxes, producedSinceRetry};
   })();`, context);
   env.onInput = context.window.testApi.onComposerHuman;
   return { env, api: context.window.testApi, context, storage,
@@ -282,4 +286,117 @@ test('write guard is released after exceptions and fallback input', () => {
   assert.equal(h.env.composer.textContent, 'fallback');
   assert.equal(h.api.state.composerWriteDepth, 0);
   assert.equal(h.api.state.lastHumanInputAt, 0);
+});
+
+// ---- high demand 报错框（v0.15）------------------------------------------------
+// 实测形态：aside > div > span.wrap-anywhere，文本 75 字符，比 growthEpsilon(40) 长。
+// 它一旦被算成正文产出，重试会话 / 验收窗 / 耗尽证据会同时作废。
+const HD = 'We’re currently experiencing high demand, which may cause temporary errors.';
+
+class FakeEl {
+  constructor(tag, { cls = '', text = '', kids = [] } = {}) {
+    this.nodeType = 1;
+    this.tagName = tag.toUpperCase();
+    this.className = cls;
+    this.id = '';
+    this.text = text;
+    this.kids = kids;
+    this.parent = null;
+    for (const k of kids) k.parent = this;
+  }
+  get textContent() { return this.text + this.kids.map(k => k.textContent).join(''); }
+  get children() { return this.kids; }
+  set children(v) { this.kids = v; for (const k of v) k.parent = this; }
+  descendants() {
+    const out = [];
+    for (const k of this.kids) { out.push(k); out.push(...k.descendants()); }
+    return out;
+  }
+  querySelectorAll(sel) {
+    const tags = sel.split(',').map(s => s.trim().toLowerCase());
+    return this.descendants().filter(e => tags.includes(e.tagName.toLowerCase()));
+  }
+  matches(sel) {
+    return sel.split(',').map(s => s.trim()).some(s =>
+      s.startsWith('#') ? this.id === s.slice(1)
+        : s.startsWith('.') ? this.className.split(' ').includes(s.slice(1))
+        : this.tagName.toLowerCase() === s);
+  }
+  closest(sel) { for (let n = this; n; n = n.parent) if (n.matches(sel)) return n; return null; }
+  contains(el) { for (let n = el; n; n = n.parent) if (n === this) return true; return false; }
+}
+
+/** 长度扫描带 500ms 缓存，测试里每读一次都要作废掉 */
+const measure = h => { h.api.state.lenCacheAt = 0; return h.api.threadLenFrom([]); };
+
+test('high demand box adds nothing to the output length and is not treated as produced content', () => {
+  const h = harness();
+  const prose = new FakeEl('div', { cls: 'min-w-0 text-size-chat', kids: [
+    new FakeEl('span', { text: '好的，我接着把剩下的四百步跑完：先登记进度，再按每五十步一段提交结果，中途不再做阶段总结。' }),
+  ] });
+  const box = new FakeEl('aside', { cls: 'relative isolate bg-surface border', kids: [
+    new FakeEl('div', { cls: 'min-w-0 flex-1', kids: [new FakeEl('span', { cls: 'wrap-anywhere', text: HD })] }),
+  ] });
+  const root = new FakeEl('div', { kids: [prose] });
+  h.env.root = root;
+
+  const beforeBox = measure(h);
+  root.children = [prose, box];
+  const withBox = measure(h);
+  assert.equal(withBox, beforeBox, '报错框出现后长度必须不变');
+  assert.equal(h.api.state.hdLeaves, 1);
+  assert.equal(h.api.state.rlLeaves, 0);
+
+  // 只取最小叶子：aside 和中间 div 都含同一句文案，重复扣字会把长度算负
+  const leaves = h.api.errorTextLeaves();
+  assert.equal(leaves.length, 1);
+  assert.equal(leaves[0].tagName, 'SPAN');
+  assert.equal(leaves[0].textContent, HD);
+
+  // 这一条就是被打断取消的根因：lenAtRetryStart 在框出现之前，框出现后不许算产出
+  h.api.state.lenAtRetryStart = beforeBox;
+  h.api.state.len = withBox;
+  assert.equal(h.api.producedSinceRetry(h.api.state, h.api.CONFIG), false);
+
+  // 反例：真出了正文，producedSinceRetry 必须成立（修好了也不能把真产出看漏）
+  const realOutput = new FakeEl('div', { cls: 'min-w-0 text-size-chat', kids: [
+    new FakeEl('span', { text: '第一段：已登记 120 步进度，接下来按每五十步一段提交结果，中途不再做阶段总结。' }),
+  ] });
+  root.children = [prose, box, realOutput];
+  h.api.state.len = measure(h);
+  assert.equal(h.api.producedSinceRetry(h.api.state, h.api.CONFIG), true);
+});
+
+test('the same sentence quoted inside model prose stays counted', () => {
+  const h = harness();
+  const quote = new FakeEl('div', { cls: 'min-w-0 text-size-chat', kids: [
+    new FakeEl('span', { text: `网关返回的原文是 ${HD}，这就是 high demand 的典型文案。` }),
+  ] });
+  const root = new FakeEl('div', { kids: [quote] });
+  h.env.root = root;
+  assert.equal(h.api.errorTextLeaves().length, 0);
+  assert.equal(measure(h), root.textContent.length);
+  assert.equal(h.api.state.hdLeaves, 0);
+});
+
+test('a newly mounted high demand box becomes this-turn evidence, base follows virtual scroll', () => {
+  const h = harness();
+  const s = h.api.state;
+  s.highDemandBase = 0; s.highDemandHit = null;
+  s.hdLeaves = 0;
+  h.api.trackHighDemandBoxes();
+  assert.equal(s.highDemandHit, null, '数量没变多不许当成本轮撞到');
+
+  s.len = 5000;
+  s.hdLeaves = 1;
+  h.api.trackHighDemandBoxes();
+  // 证据对象是在脚本自己的 vm realm 里 new 的，跨 realm 只能比字段不能比引用
+  assert.equal(s.highDemandHit?.len, 5000);
+  assert.equal(s.highDemandBase, 1);
+
+  // 虚拟滚动把框摘掉：基准跟着下调，否则永远等不到「变多」；已记下的证据不许丢
+  s.hdLeaves = 0;
+  h.api.trackHighDemandBoxes();
+  assert.equal(s.highDemandBase, 0);
+  assert.ok(s.highDemandHit, '摘掉旧框不该作废本轮证据');
 });

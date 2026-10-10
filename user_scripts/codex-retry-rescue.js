@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Codex Retry Rescue
-// @version      0.14.1
+// @version      0.15.0
 // @description  Codex 断流/限流/会话死亡自动救援：重试逼近上限时打断并继续刷新预算，400 类死会话自动开新对话接续，带状态条与后台看门狗
 // ==/UserScript==
 //
@@ -24,6 +24,9 @@
 //   * 0.13 起：限流把这一轮停住后立刻发「继续」，不再排自托管读秒。判据是「本轮
 //     新弹出一个报错框 + 之后没有任何实质产出 + 本轮真的跑过」，缺一条都不动手，
 //     免得点开一条历史限流会话就被当成故障。
+//   * 0.15 起：「We’re currently experiencing high demand…」这类 high demand 报错
+//     单独一类（platform.highDemandText）：走预防性打断（7~9 随机临界），撞上后
+//     停下也立刻续跑。绝不能并进 rateLimitText —— 限流禁止打断，而这条正是要打断。
 //
 // 实测要点（都是踩过的坑，改动前先读）：
 //   * 重试次数是滚动数字动画，textContent 读出来是 "0123456789"，真值在
@@ -35,6 +38,10 @@
 //     爬升停止超过 sessionIdleMs、一旦内容开始产出、或脚本动过手，会话结束。
 //     会话外的冻结高次数行（含上次接管留下的 7~9）永远不会触发打断 —— 否则
 //     模型长时间思考（无输出滚动）时会被残留计数误判成正在重试。
+//   * 报错框的文案必须和重试行一样被当成「非产出」。实测 high demand 那条是一个
+//     aside 里的 span.wrap-anywhere，75 个字符，比 growthEpsilon(40) 还长：不扣掉的话
+//     它每次挂载/被虚拟滚动重新挂载都会被判成「模型出字了 = 这一发成功了」，
+//     于是重试会话、验收窗、耗尽证据三样同时作废，7~9 的打断永远不会发生。
 //   * 输入框/发送/停止/继续 是同一个 composer 按钮，靠 aria-label 区分状态；
 //     不要全局扫 button，顶部工具栏的「创建文件或站点」也带同样的 class 片段。
 //   * 绝对不要用 MutationObserver 驱动这个脚本：状态条自身在被观察的树里，
@@ -71,6 +78,8 @@
     skipPreventiveOnRateLimit: true,
     // 本轮确实撞到限流、且已停止 → 立刻发「继续」，不等自托管读秒
     rateLimitImmediate: true,
+    // 本轮撞到 high demand、且已停止 → 同上立刻续跑（重连行没冒出来也能救）
+    highDemandImmediate: true,
     thresholds: [7, 8, 9],
     confirmWindowMs: [3000, 4000],
     settleMs: [200, 600],
@@ -117,6 +126,13 @@
       retryText: "正在重新连接|重新连接|Reconnecting|Reconnect",
       // 限流文案。命中即当作 rate limit：不做预防性打断，等 10/10 耗尽后再发「继续」。
       rateLimitText: "rate\\s*limit|token\\s*rate\\s*limit|\\b429\\b|限流|超出.{0,6}限",
+      // 「上游通道池满载」这类暂时性报错的文案。实测原文：
+      //   We’re currently experiencing high demand, which may cause temporary errors.
+      // 注意它和限流的处理正好相反：限流不能打断（越打越挤），high demand 就是要抢在
+      // 打满前用 7~9 随机临界打断刷新预算，所以千万不要把它并进 rateLimitText。
+      // 这句是服务端文案，界面其它部分汉化了它仍是英文；真遇到汉化版就把原文贴进来。
+      // 认不出来的后果只是「这一类不救」，不会点错。
+      highDemandText: "high\\s+demand",
       // 「本次请求被拒、这个会话已经救不回来」的文案。必须有第 1 个捕获组给出 3 位 HTTP 状态码，
       // 状态码再拿去和上面的 fatalCodes 比。换服务商时先照抄界面原文再改这里的数字部分。
       fatalText: "bad response status code\\s*(\\d{3})",
@@ -135,6 +151,7 @@
   };
   const RETRY_RE = toRe(CONFIG.platform.retryText);
   const RATE_LIMIT_RE = toRe(CONFIG.platform.rateLimitText);
+  const HIGH_DEMAND_RE = toRe(CONFIG.platform.highDemandText, "i");
   const FATAL_ERR_RE = toRe(CONFIG.platform.fatalText, "i");
   const FATAL_REQ_ID_RE = toRe(CONFIG.platform.fatalRequestId, "i");
   const FATAL_CONTAINER_SEL = (CONFIG.platform.fatalContainers || "")
@@ -280,6 +297,10 @@
     rateLimitBase: 0,
     rateLimitHit: null,   // { len }：撞框那一刻的对话区长度（已扣除报错文案）
     rlLeaves: 0,          // 最近一次长度扫描数到的限流文案叶节点数
+    // high demand 报错框：和限流框同一套「本轮新撞」判据，因为报错框同样会永久留着
+    highDemandBase: 0,
+    highDemandHit: null,
+    hdLeaves: 0,
   };
 
   function note(msg) {
@@ -454,10 +475,15 @@
   }
 
   /**
-   * 错误文案叶节点（限流 / 会话已死）。
+   * 错误文案叶节点（限流 / 会话已死 / high demand）。
    * 这里故意不要求它在 aside 容器里 —— 同一段报错在界面上会出现两份（错误框里一份、
    * 会话条目里一份），只要像报错文案就不该算成模型产出。容器约束是给 400 迁移用的
    * （那边认错代价是乱开新聊天），这边漏扣一百字最多让「没产出」更容易成立。
+   *
+   * 唯一的例外是 high demand：那句 "…experiencing high demand, which may cause
+   * temporary errors" 本身就是通顺的英文句子，模型正文里完全可能原样出现一次，
+   * 扣掉就少算产出。所以它必须在错误框容器（platform.fatalContainers）里才算数。
+   * 实测那个框是 aside > div > span.wrap-anywhere，容器选择器天然命中。
    *
    * 不缓存：报错框出现的那一拍必须同时把它从长度里扣掉。缓存过期会让 len 先跳一百多字
    * 再落回去，而那一跳正好足够把「本轮耗尽证据」误判成「已产出」永久清掉。
@@ -468,10 +494,13 @@
     if (el.id === HOST_ID || el.closest?.(`#${HOST_ID}`)) return false;
     const t = (el.textContent || "").replace(/\s+/g, " ").trim();
     if (!t || t.length > 400) return false;
-    if (!FATAL_ERR_RE.test(t) && !RATE_LIMIT_RE.test(t)) return false;
+    const hardError = FATAL_ERR_RE.test(t) || RATE_LIMIT_RE.test(t);
+    if (!hardError && !(HIGH_DEMAND_RE.test(t) && inFatalContainer(el))) return false;
     return ![...el.children].some(c => {
       const s = c.textContent || "";
-      return FATAL_ERR_RE.test(s) || RATE_LIMIT_RE.test(s);
+      // 子节点里已有同一段文案 → 拿到的是外层容器，会重复扣字，必须往下取叶子
+      return FATAL_ERR_RE.test(s) || RATE_LIMIT_RE.test(s)
+          || (HIGH_DEMAND_RE.test(s) && inFatalContainer(c));
     });
   }
 
@@ -495,18 +524,21 @@
     const t = now();
     if (state.lenCacheAt && t - state.lenCacheAt < 500) return state.lenCache;
     const root = threadRoot();
-    if (!root) { state.lenCache = 0; state.lenCacheAt = t; state.rlLeaves = 0; return 0; }
+    if (!root) { state.lenCache = 0; state.lenCacheAt = t; state.rlLeaves = 0; state.hdLeaves = 0; return 0; }
     let len = (root.textContent || "").length;
     const ignored = new Set(cands);
     ignored.add(document.getElementById(HOST_ID));
     ignored.add(findComposer());
-    // 顺手数一下限流文案有几份：这次扫描本来就要遍历这些叶子，不再另开一遍
-    let rl = 0;
+    // 顺手数一下限流 / high demand 文案各有几份：这次扫描本来就要遍历这些叶子，不再另开一遍
+    let rl = 0, hd = 0;
     for (const el of errorTextLeaves()) {
       ignored.add(el);
-      if (RATE_LIMIT_RE.test((el.textContent || "").replace(/\s+/g, " ").trim())) rl++;
+      const t2 = (el.textContent || "").replace(/\s+/g, " ").trim();
+      if (RATE_LIMIT_RE.test(t2)) rl++;
+      else if (HIGH_DEMAND_RE.test(t2)) hd++;
     }
     state.rlLeaves = rl;
+    state.hdLeaves = hd;
     for (const el of ignored) len -= subtractTextLen(root, el);
     state.lenCache = Math.max(0, len);
     state.lenCacheAt = t;
@@ -711,6 +743,19 @@
     if (n > state.rateLimitBase) {
       state.rateLimitBase = n;
       state.rateLimitHit = { len: state.len };
+    }
+  }
+
+  /** 同上，跟 high demand 报错框的数量。多出一个 = 本轮又撞了一发 */
+  function trackHighDemandBoxes() {
+    const n = state.hdLeaves;
+    if (n < state.highDemandBase) state.highDemandBase = n;
+    if (n > state.highDemandBase) {
+      state.highDemandBase = n;
+      if (!state.highDemandHit) {
+        state.highDemandHit = { len: state.len };
+        note(`本轮撞到 high demand 报错框（第 ${state.hdLeaves} 个）`);
+      }
     }
   }
 
@@ -985,6 +1030,7 @@
     // 证据只消费一次：续跑失败也不重复轰炸，交给「脱离接管」那条路
     state.turnExhausted = null;
     state.rateLimitHit = null;
+    state.highDemandHit = null;
     try {
       state.round++;
       note(`第 ${state.round} 轮：${reason || "重试已耗尽并报错"}，立即用续跑提示词重新触发`);
@@ -1307,6 +1353,8 @@
       state.len = threadLen();
       state.rateLimitHit = null;
       state.rateLimitBase = state.rlLeaves;
+      state.highDemandHit = null;
+      state.highDemandBase = state.hdLeaves;
       markCurrentFatalsResidual();   // 新会话里已有的 400 全是残留
     }
     state.currentThreadId = nowTid;
@@ -1329,8 +1377,9 @@
     if (!CONFIG.enabled) { cancelSelfHost("已暂停"); state.status = "paused"; return; }
     if (state.busy || state.sending) return;
 
-    // 限流报错框的「本轮新撞」判定要在任何分支之前先跟一遍
+    // 限流 / high demand 报错框的「本轮新撞」判定要在任何分支之前先跟一遍
     trackRateLimitBoxes();
+    trackHighDemandBoxes();
 
     // turn 边界：上一拍还不是 stop（send/继续/未知）现在变 stop = 新的一轮开始了。
     // 此时把现存重试行/历史错误全部打成残留，避免上一轮的计数或旧 400 进入本轮判定。
@@ -1342,6 +1391,8 @@
       state.turnExhausted = null;   // 上一轮的耗尽证据随 turn 作废
       state.rateLimitHit = null;
       state.rateLimitBase = state.rlLeaves;   // 本轮开始就存在的框，全部算历史
+      state.highDemandHit = null;
+      state.highDemandBase = state.hdLeaves;
       markCurrentFatalsResidual();
     }
     const nowTid = state.currentThreadId;
@@ -1373,6 +1424,9 @@
     // 撞框之后又出了实质正文 → 那一发是连上的，不是收尸现场
     if (state.rateLimitHit && state.len - state.rateLimitHit.len >= CONFIG.growthEpsilon) {
       state.rateLimitHit = null;
+    }
+    if (state.highDemandHit && state.len - state.highDemandHit.len >= CONFIG.growthEpsilon) {
+      state.highDemandHit = null;
     }
 
     if (st.kind === "stop") {
@@ -1498,6 +1552,15 @@
           && state.round < CONFIG.maxRounds) {
         state.status = "exhausted";
         handleExhausted(reading, "本轮撞上限流且已停止");   // 证据在这里消费掉
+        return;
+      }
+
+      // 同上，但撞的是 high demand：这条经常不经过「正在重新连接 n/10」就直接打回，
+      // 上面那条打满判定（要亲眼见过 n==max）等不到证据，不补这一条就只能干等读秒。
+      if (CONFIG.highDemandImmediate && state.highDemandHit && state.sawRunningTurn
+          && state.round < CONFIG.maxRounds) {
+        state.status = "exhausted";
+        handleExhausted(reading, "本轮撞到 high demand 且已停止");
         return;
       }
 
@@ -2088,6 +2151,7 @@
   markAllRetriesStale();
   markCurrentFatalsResidual();
   state.rateLimitBase = state.rlLeaves;   // 启动时就存在的限流框全是历史
+  state.highDemandBase = state.hdLeaves;  // high demand 框同理
   state.currentThreadId = readCurrentThreadId();
   CONFIG.selfHost = selfHostEnabled();
 
@@ -2243,6 +2307,7 @@
     flowing,
     producedSinceRetry,
     threadLen,
+    errorTextLeaves,
     layoutUsable,
     readFatalError,
     readCurrentThreadId,
