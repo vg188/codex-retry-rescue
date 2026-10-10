@@ -11,7 +11,7 @@
 | 界面上看到的 | 性质 | 脚本做什么 |
 |---|---|---|
 | `正在重新连接 8/10`、上游地址失败 | 流断了，请求本身没问题 | **预防性打断**：确认这一发已经失败后点「停止」，等几秒点「继续」，把重试预算归零 |
-| `We’re currently experiencing high demand, which may cause temporary errors.` | 通道池满载，同上，还能重连 | 同上走**预防性打断**（7~9 随机临界）；这一轮没经过重连行就被打回、且已停下 → **立刻**发「继续」（`highDemandImmediate`） |
+| `We’re currently experiencing high demand, which may cause temporary errors.` | 通道池满载，同上，还能重连 | 同上走**预防性打断**（7~9 随机临界）；这一轮没经过重连行就被打回、且已停下 → **立刻**发「继续」（`highDemandImmediate`）。实测这句会同时出现多份（错误框里 + 每个重试行下面），全部都不许算成产出 |
 | `rate limit exceeded … token rate limit`、429 | 限流 | **不打断**（打断等于继续加请求）；这一轮停下后**立刻**发「继续」，不排自托管读秒 |
 | `bad response status code 400/413/422` 错误框 | 请求被拒，原地继续必然再失败 | **死会话迁移**：开新聊天 + 发 `读取{threadId}，继续` |
 | 重试打满、本轮没产出 | 预算耗尽 | 同一个会话里发一句「继续」 |
@@ -45,6 +45,7 @@
 | `retryText` | 重试行：`正在重新连接 8/10` | `正在重新连接\|重新连接\|Reconnecting\|Reconnect` |
 | `rateLimitText` | 限流文案，命中就不做预防性打断 | `rate\\s*limit\|token\\s*rate\\s*limit\|\\b429\\b\|限流\|超出.{0,6}限` |
 | `highDemandText` | 通道池满载那句暂时性报错（见上面故障表）。**别并进 `rateLimitText`**：限流禁止打断，这条正因为要打断才单独分一类 | `high\\s+demand` |
+| `activityTimerText` | 活动行里每秒自己变长的状态标签（`已处理 1分钟 42秒`、`你在 0秒 后停止了`），只用来扣长度、不驱动动作 | `^(已处理\|已用时\|用时\|耗时)\\s…$^\|你在…后停止了$^\|^(processed\|elapsed\|took)\\s…$`（完整式子见脚本） |
 | `fatalText` | 「会话已死」的错误框文案，**第 1 个捕获组必须是 3 位状态码** | `bad response status code\\s*(\\d{3})` |
 | `fatalRequestId` | 从同一句文案里取请求标识用于去重；没有就填 `""` | `request id:\\s*([^)\\s]+)` |
 | `fatalContainers` | 错误框的 DOM 特征（逗号分隔 CSS 选择器），命中才算错误框 | `aside,.wrap-anywhere` |
@@ -135,6 +136,7 @@ start-retry-watchdog.cmd                      # 或者双击，最小化跑，�
 
 - **历史残留不算现役**：重试行和错误框会永久留在 transcript 里。只有本 turn 内次数真的爬升过、或本 turn 跑起来后新出现的错误，才会触发动作
 - **跳号只证明上一发失败**：`8/10 → 9/10` 之后还要过 3–4s 验收窗，这一发若开始出字、或冒出限流，立刻取消打断
+- **界面 chrome 不算产出**：报错文案（同一句可能有好几份）和活动行的计时标签（`已处理 1分钟 42秒`）都不计入对话区长度，否则它们一跳就把「这一发成功了」判成真的
 - **只正面识别按钮**：`停止 / 发送 / 继续` 之外的未知态（例如「排队」）一律不点
 - **切会话即复位**：点开一条带 400 的旧会话不会被自动迁移；错误框还要连续存在 8s 才动手
 - **草稿保护**：输入框有内容时不覆盖、不发送
@@ -142,7 +144,7 @@ start-retry-watchdog.cmd                      # 或者双击，最小化跑，�
 
 ## 已知边界
 
-- 界面大改版时选择器要对一次：`retryText` / `fatalContainers` / composer 按钮的 `aria-label`（脚本内注释标了实测形态）
+- 界面大改版时选择器要对一次：`retryText` / `highDemandText` / `activityTimerText` / `fatalContainers` / composer 按钮的 `aria-label`（脚本内注释标了实测形态）
 - 英文界面只覆盖了 `Reconnecting / Stop / Send / Continue / Resume` 这类常见词
 - thread id 依赖 `/state` 面板与侧栏 `data-app-action-sidebar-thread-id`；两者都没有时迁移会跳过而不是乱填 id
 - 不做 anything-but-UI 的事：不改 `config.toml`，不碰网络层。想要「流断了代理自己续」那种终态，得走本地重试代理

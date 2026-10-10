@@ -288,9 +288,12 @@ test('write guard is released after exceptions and fallback input', () => {
   assert.equal(h.api.state.lastHumanInputAt, 0);
 });
 
-// ---- high demand 报错框（v0.15）------------------------------------------------
-// 实测形态：aside > div > span.wrap-anywhere，文本 75 字符，比 growthEpsilon(40) 长。
-// 它一旦被算成正文产出，重试会话 / 验收窗 / 耗尽证据会同时作废。
+// ---- high demand 报错文案（v0.15）----------------------------------------------
+// 实测：同一句话在界面上出现**两份**，各 75 字符，都比 growthEpsilon(40) 长 ——
+//   1) aside 错误框里：aside > div > div > span.wrap-anywhere
+//   2) 重试行下面的详情行：div.text-size-chat.whitespace-pre-wrap
+// 两份都要从长度里扣掉（只扣一份等于没扣，0.15.0 就栽在这）；但只有错误框那份
+// 算「本轮撞到」的证据，因为那条会驱动自动发「继续」。
 const HD = 'We’re currently experiencing high demand, which may cause temporary errors.';
 
 class FakeEl {
@@ -329,54 +332,66 @@ class FakeEl {
 /** 长度扫描带 500ms 缓存，测试里每读一次都要作废掉 */
 const measure = h => { h.api.state.lenCacheAt = 0; return h.api.threadLenFrom([]); };
 
-test('high demand box adds nothing to the output length and is not treated as produced content', () => {
+/** 真实界面上的两份副本 */
+const hdBox = () => new FakeEl('aside', { cls: 'relative isolate bg-surface border', kids: [
+  new FakeEl('div', { cls: 'min-w-0 flex-1', kids: [
+    new FakeEl('div', { cls: 'electron:leading-relaxed text-pretty', kids: [
+      new FakeEl('span', { cls: 'wrap-anywhere', text: HD }),
+    ] }),
+  ] }),
+] });
+const hdDetail = () => new FakeEl('div', { cls: 'text-size-chat whitespace-pre-wrap text-codex-description/80', text: HD });
+
+test('both copies of the high demand sentence add nothing to the output length', () => {
   const h = harness();
   const prose = new FakeEl('div', { cls: 'min-w-0 text-size-chat', kids: [
     new FakeEl('span', { text: '好的，我接着把剩下的四百步跑完：先登记进度，再按每五十步一段提交结果，中途不再做阶段总结。' }),
   ] });
-  const box = new FakeEl('aside', { cls: 'relative isolate bg-surface border', kids: [
-    new FakeEl('div', { cls: 'min-w-0 flex-1', kids: [new FakeEl('span', { cls: 'wrap-anywhere', text: HD })] }),
-  ] });
   const root = new FakeEl('div', { kids: [prose] });
   h.env.root = root;
 
-  const beforeBox = measure(h);
-  root.children = [prose, box];
-  const withBox = measure(h);
-  assert.equal(withBox, beforeBox, '报错框出现后长度必须不变');
-  assert.equal(h.api.state.hdLeaves, 1);
+  const baseline = measure(h);
+  root.children = [prose, hdDetail(), hdBox()];
+  const withBoth = measure(h);
+  assert.equal(withBoth, baseline, '两份报错文案都出现后，长度必须和没出现时一样');
+  assert.equal(h.api.state.hdLeaves, 1, '只有错误框那一份算「本轮撞到」的证据');
   assert.equal(h.api.state.rlLeaves, 0);
 
-  // 只取最小叶子：aside 和中间 div 都含同一句文案，重复扣字会把长度算负
+  // 只取最小叶子：aside 和它里面的中间 div 都含同一句文案，重复扣字会把长度算负
   const leaves = h.api.errorTextLeaves();
-  assert.equal(leaves.length, 1);
-  assert.equal(leaves[0].tagName, 'SPAN');
-  assert.equal(leaves[0].textContent, HD);
+  assert.equal(leaves.length, 2);
+  // 数组来自脚本自己的 vm realm，deepEqual 会比不了 → 逐个比字段
+  assert.equal(leaves.map(e => e.textContent).join('|'), `${HD}|${HD}`);
 
-  // 这一条就是被打断取消的根因：lenAtRetryStart 在框出现之前，框出现后不许算产出
-  h.api.state.lenAtRetryStart = beforeBox;
-  h.api.state.len = withBox;
+  // 这一条就是被打断取消的根因：lenAtRetryStart 在文案出现之前，出现后不许算产出
+  h.api.state.lenAtRetryStart = baseline;
+  h.api.state.len = withBoth;
   assert.equal(h.api.producedSinceRetry(h.api.state, h.api.CONFIG), false);
 
   // 反例：真出了正文，producedSinceRetry 必须成立（修好了也不能把真产出看漏）
   const realOutput = new FakeEl('div', { cls: 'min-w-0 text-size-chat', kids: [
     new FakeEl('span', { text: '第一段：已登记 120 步进度，接下来按每五十步一段提交结果，中途不再做阶段总结。' }),
   ] });
-  root.children = [prose, box, realOutput];
+  root.children = [prose, hdDetail(), hdBox(), realOutput];
   h.api.state.len = measure(h);
   assert.equal(h.api.producedSinceRetry(h.api.state, h.api.CONFIG), true);
 });
 
-test('the same sentence quoted inside model prose stays counted', () => {
+test('the sentence quoted in model prose is excluded from length but never counts as an error box', () => {
   const h = harness();
   const quote = new FakeEl('div', { cls: 'min-w-0 text-size-chat', kids: [
     new FakeEl('span', { text: `网关返回的原文是 ${HD}，这就是 high demand 的典型文案。` }),
   ] });
   const root = new FakeEl('div', { kids: [quote] });
   h.env.root = root;
-  assert.equal(h.api.errorTextLeaves().length, 0);
-  assert.equal(measure(h), root.textContent.length);
+  // 认成错误文案（宁可少算 150 字产出），但数不到错误框 → 不许产生本轮证据
+  assert.equal(h.api.errorTextLeaves().length, 1);
+  assert.equal(measure(h), 0);
   assert.equal(h.api.state.hdLeaves, 0);
+  h.api.state.highDemandBase = 0;
+  h.api.state.highDemandHit = null;
+  h.api.trackHighDemandBoxes();
+  assert.equal(h.api.state.highDemandHit, null, '正文里引用一句话不能触发自动续跑');
 });
 
 test('a newly mounted high demand box becomes this-turn evidence, base follows virtual scroll', () => {
@@ -399,4 +414,35 @@ test('a newly mounted high demand box becomes this-turn evidence, base follows v
   h.api.trackHighDemandBoxes();
   assert.equal(s.highDemandBase, 0);
   assert.ok(s.highDemandHit, '摘掉旧框不该作废本轮证据');
+});
+
+// ---- 活动行计时标签（v0.15.1）--------------------------------------------------
+// 实测 span.tabular-nums.text-tertiary：「已处理 1分钟 42秒」「你在 0秒 后停止了」，
+// 每秒自己变长。不扣掉的话 +1 字就刷新「正在出字」，攒够 40 字还会被当成真出了正文。
+const timerSpan = text => new FakeEl('span', { cls: 'tabular-nums text-tertiary', text });
+
+test('activity status labels that tick every second add nothing to the length', () => {
+  const h = harness();
+  const row = new FakeEl('div', { cls: 'group/agent-activity flex flex-col', kids: [
+    new FakeEl('div', { cls: 'min-w-0 text-size-chat', kids: [timerSpan('已处理 1分钟 42秒')] }),
+    new FakeEl('div', { cls: 'min-w-0 text-size-chat', kids: [timerSpan('你在 0秒 后停止了')] }),
+    new FakeEl('div', { cls: 'min-w-0 text-size-chat', kids: [timerSpan('已处理 3小时 5分钟')] }),
+  ] });
+  const root = new FakeEl('div', { kids: [row] });
+  h.env.root = root;
+  assert.equal(h.api.errorTextLeaves().length, 3);
+  assert.equal(measure(h), 0, '三个计时标签都不许算进对话区长度');
+  assert.equal(h.api.state.hdLeaves, 0, '计时标签不构成本轮撞到 high demand 的证据');
+  assert.equal(h.api.state.rlLeaves, 0);
+});
+
+test('prose that merely starts with 已处理 stays counted', () => {
+  const h = harness();
+  const prose = new FakeEl('div', { cls: 'min-w-0 text-size-chat', kids: [
+    new FakeEl('span', { text: '已处理完这三批数据，接下来把剩下的四百步继续跑完，中途不再做阶段总结。' }),
+  ] });
+  const root = new FakeEl('div', { kids: [prose] });
+  h.env.root = root;
+  assert.equal(h.api.errorTextLeaves().length, 0);
+  assert.equal(measure(h), prose.textContent.length);
 });

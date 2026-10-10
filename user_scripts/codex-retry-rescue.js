@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Codex Retry Rescue
-// @version      0.15.0
+// @version      0.15.1
 // @description  Codex 断流/限流/会话死亡自动救援：重试逼近上限时打断并继续刷新预算，400 类死会话自动开新对话接续，带状态条与后台看门狗
 // ==/UserScript==
 //
@@ -27,6 +27,7 @@
 //   * 0.15 起：「We’re currently experiencing high demand…」这类 high demand 报错
 //     单独一类（platform.highDemandText）：走预防性打断（7~9 随机临界），撞上后
 //     停下也立刻续跑。绝不能并进 rateLimitText —— 限流禁止打断，而这条正是要打断。
+//     0.15.1：这句在界面上有**两份**，两份都得从长度里扣掉，只扣错误框那份等于没扣。
 //
 // 实测要点（都是踩过的坑，改动前先读）：
 //   * 重试次数是滚动数字动画，textContent 读出来是 "0123456789"，真值在
@@ -38,10 +39,14 @@
 //     爬升停止超过 sessionIdleMs、一旦内容开始产出、或脚本动过手，会话结束。
 //     会话外的冻结高次数行（含上次接管留下的 7~9）永远不会触发打断 —— 否则
 //     模型长时间思考（无输出滚动）时会被残留计数误判成正在重试。
-//   * 报错框的文案必须和重试行一样被当成「非产出」。实测 high demand 那条是一个
-//     aside 里的 span.wrap-anywhere，75 个字符，比 growthEpsilon(40) 还长：不扣掉的话
-//     它每次挂载/被虚拟滚动重新挂载都会被判成「模型出字了 = 这一发成功了」，
-//     于是重试会话、验收窗、耗尽证据三样同时作废，7~9 的打断永远不会发生。
+//   * 报错框的文案必须和重试行一样被当成「非产出」。实测 high demand 那句**同时出现两份**：
+//     aside 错误框里一份 span.wrap-anywhere，重试行下面还有一份
+//     div.text-size-chat.whitespace-pre-wrap，各 75 字，都比 growthEpsilon(40) 长。
+//     只扣一份等于没扣：没扣的那份每次挂载/被虚拟滚动重新挂载都会被判成「模型出字了 =
+//     这一发成功了」，于是重试会话、验收窗、耗尽证据三样同时作废，7~9 的打断永远不会发生。
+//   * 活动行里有**每秒自己变长**的状态标签（`已处理 1分钟 42秒`、`你在 0秒 后停止了`），
+//     它们不是产出但会进 threadLen：+1 字就把「正在出字」刷新一次，攒够 growthEpsilon
+//     还会被当成「这一发成功开始输出」。所以这类文案也要从长度里扣掉（platform.activityTimerText）。
 //   * 输入框/发送/停止/继续 是同一个 composer 按钮，靠 aria-label 区分状态；
 //     不要全局扫 button，顶部工具栏的「创建文件或站点」也带同样的 class 片段。
 //   * 绝对不要用 MutationObserver 驱动这个脚本：状态条自身在被观察的树里，
@@ -128,11 +133,22 @@
       rateLimitText: "rate\\s*limit|token\\s*rate\\s*limit|\\b429\\b|限流|超出.{0,6}限",
       // 「上游通道池满载」这类暂时性报错的文案。实测原文：
       //   We’re currently experiencing high demand, which may cause temporary errors.
+      // 同一段文案界面上会出现两份（错误框里一份、重试行下面一份），两条都靠这一条正则认。
       // 注意它和限流的处理正好相反：限流不能打断（越打越挤），high demand 就是要抢在
       // 打满前用 7~9 随机临界打断刷新预算，所以千万不要把它并进 rateLimitText。
       // 这句是服务端文案，界面其它部分汉化了它仍是英文；真遇到汉化版就把原文贴进来。
       // 认不出来的后果只是「这一类不救」，不会点错。
       highDemandText: "high\\s+demand",
+      // 活动行里那些**每秒自己变长**的状态标签：`已处理 1分钟 42秒`、`你在 0秒 后停止了`
+      // （实测都是 span.tabular-nums.text-tertiary）。它们不是模型产出，但会一路加进对话区
+      // 长度里：+1 字就把「正在出字」刷新一次，攒够 40 字更会被当成「这一发成功开始输出」，
+      // 于是验收窗被撤、重试会话被结束、耗尽证据被清掉 —— 和报错文案是叠加的两处误判。
+      // 只用来扣长度，不驱动任何动作；界面换文案就把新的样子并进来。
+      activityTimerText: "^(已处理|已用时|用时|耗时)\\s[\\d\\s]*\\d\\s*(天|小时|分钟|秒|[hms])"
+        + "(\\s[\\d\\s]*\\d\\s*(天|小时|分钟|秒|[hms]))*\\s*$"
+        + "|^你在\\s[\\d\\s]*\\d\\s*秒\\s*后停止了\\s*$"
+        + "|^(processed|elapsed|took)\\s[\\d\\s]*\\d\\s*(hours?|minutes?|seconds?|secs?|[hms])"
+        + "(\\s[\\d\\s]*\\d\\s*(hours?|minutes?|seconds?|secs?|[hms]))*\\s*$",
       // 「本次请求被拒、这个会话已经救不回来」的文案。必须有第 1 个捕获组给出 3 位 HTTP 状态码，
       // 状态码再拿去和上面的 fatalCodes 比。换服务商时先照抄界面原文再改这里的数字部分。
       fatalText: "bad response status code\\s*(\\d{3})",
@@ -152,6 +168,7 @@
   const RETRY_RE = toRe(CONFIG.platform.retryText);
   const RATE_LIMIT_RE = toRe(CONFIG.platform.rateLimitText);
   const HIGH_DEMAND_RE = toRe(CONFIG.platform.highDemandText, "i");
+  const ACTIVITY_TIMER_RE = toRe(CONFIG.platform.activityTimerText, "i");
   const FATAL_ERR_RE = toRe(CONFIG.platform.fatalText, "i");
   const FATAL_REQ_ID_RE = toRe(CONFIG.platform.fatalRequestId, "i");
   const FATAL_CONTAINER_SEL = (CONFIG.platform.fatalContainers || "")
@@ -475,15 +492,16 @@
   }
 
   /**
-   * 错误文案叶节点（限流 / 会话已死 / high demand）。
+   * 错误文案 / 状态标签叶节点（限流 / 会话已死 / high demand / 已用时计时）。
    * 这里故意不要求它在 aside 容器里 —— 同一段报错在界面上会出现两份（错误框里一份、
    * 会话条目里一份），只要像报错文案就不该算成模型产出。容器约束是给 400 迁移用的
    * （那边认错代价是乱开新聊天），这边漏扣一百字最多让「没产出」更容易成立。
    *
-   * 唯一的例外是 high demand：那句 "…experiencing high demand, which may cause
-   * temporary errors" 本身就是通顺的英文句子，模型正文里完全可能原样出现一次，
-   * 扣掉就少算产出。所以它必须在错误框容器（platform.fatalContainers）里才算数。
-   * 实测那个框是 aside > div > span.wrap-anywhere，容器选择器天然命中。
+   * high demand 实测就是「同一句出现多份」的活案例：aside 错误框里一份
+   * span.wrap-anywhere，重试行下面还有 N 份 div.text-size-chat.whitespace-pre-wrap
+   * （历史轮每挂一份），各 75 字。0.15.0 只按容器认了 aside 那份，其余继续被算成
+   * 产出，打断照样被取消 —— 所以扣长度时三类文案一视同仁、都不看容器。
+   * 需要容器/结构的是「本轮撞到」那份证据，见 threadLenFrom。
    *
    * 不缓存：报错框出现的那一拍必须同时把它从长度里扣掉。缓存过期会让 len 先跳一百多字
    * 再落回去，而那一跳正好足够把「本轮耗尽证据」误判成「已产出」永久清掉。
@@ -494,13 +512,13 @@
     if (el.id === HOST_ID || el.closest?.(`#${HOST_ID}`)) return false;
     const t = (el.textContent || "").replace(/\s+/g, " ").trim();
     if (!t || t.length > 400) return false;
-    const hardError = FATAL_ERR_RE.test(t) || RATE_LIMIT_RE.test(t);
-    if (!hardError && !(HIGH_DEMAND_RE.test(t) && inFatalContainer(el))) return false;
+    if (!FATAL_ERR_RE.test(t) && !RATE_LIMIT_RE.test(t)
+        && !HIGH_DEMAND_RE.test(t) && !ACTIVITY_TIMER_RE.test(t)) return false;
     return ![...el.children].some(c => {
       const s = c.textContent || "";
       // 子节点里已有同一段文案 → 拿到的是外层容器，会重复扣字，必须往下取叶子
       return FATAL_ERR_RE.test(s) || RATE_LIMIT_RE.test(s)
-          || (HIGH_DEMAND_RE.test(s) && inFatalContainer(c));
+          || HIGH_DEMAND_RE.test(s) || ACTIVITY_TIMER_RE.test(s);
     });
   }
 
@@ -530,12 +548,14 @@
     ignored.add(document.getElementById(HOST_ID));
     ignored.add(findComposer());
     // 顺手数一下限流 / high demand 文案各有几份：这次扫描本来就要遍历这些叶子，不再另开一遍
+    // high demand 只数错误框里那份。会话条目里那份同样已经从长度里扣掉，但它不构成本轮证据：
+    // 「撞到框就立刻续跑」是要动手发「继续」的，正文里偶然引用这句话不该算撞到了。
     let rl = 0, hd = 0;
     for (const el of errorTextLeaves()) {
       ignored.add(el);
       const t2 = (el.textContent || "").replace(/\s+/g, " ").trim();
       if (RATE_LIMIT_RE.test(t2)) rl++;
-      else if (HIGH_DEMAND_RE.test(t2)) hd++;
+      else if (HIGH_DEMAND_RE.test(t2) && inFatalContainer(el)) hd++;
     }
     state.rlLeaves = rl;
     state.hdLeaves = hd;
