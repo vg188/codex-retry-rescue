@@ -85,7 +85,7 @@
     rateLimitImmediate: true,
     // 本轮撞到 high demand、且已停止 → 同上立刻续跑（重连行没冒出来也能救）
     highDemandImmediate: true,
-    thresholds: [7, 8, 9],
+    thresholds: [6, 7, 8],
     confirmWindowMs: [3000, 4000],
     settleMs: [200, 600],
     resumeDelayMs: [2500, 7000],
